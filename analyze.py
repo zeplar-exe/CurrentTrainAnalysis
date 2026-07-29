@@ -1,7 +1,8 @@
-import os
 import sqlite3
+import events
 import psutil
 import time
+from pathlib import Path
 
 import mne
 import scipy
@@ -13,7 +14,7 @@ from rich.live import Live
 from rich.panel import Panel
 
 OUT = "cta/"
-BASE_PATH = "./physionet-motorimagery"
+BASE_PATH = Path("./physionet-motorimagery")
 RECORDS = []
 
 BANDS = {
@@ -49,24 +50,25 @@ BANDS = {
     },
 }
 
-with open(f"{BASE_PATH}/RECORDS") as f:
+with open(BASE_PATH / "RECORDS") as f:
     for line in f:
         RECORDS.append(line.strip())
 
 def get_subject_data(record):
     subject = record[5:9]
     session = record[9:12]
-    raw = mne.io.read_raw_edf(f"{BASE_PATH}/{subject}/{subject}{session}.edf", preload=True)
-    events = mne.events_from_annotations(raw)
+    raw = mne.io.read_raw_edf(BASE_PATH / subject / f"{subject}{session}.edf", preload=True)
+    raw.notch_filter(freqs=60.0, fir_design='firwin')
+    events, _ = mne.events_from_annotations(raw)
     
     return raw, events
 
-def get_raw_band_deviations(raw, bands, plot=False):
+def get_raw_band_deviations(raw, bands, plot=False, band_data=BANDS):
     devs = []
     nyq = raw.info["sfreq"] / 2.0
     
     for band_name in bands:
-        band = BANDS[band_name]
+        band = band_data[band_name]
         high = band["high"]
         
         if band["low"] > nyq:
@@ -96,7 +98,8 @@ def get_raw_band_deviations(raw, bands, plot=False):
 
 class SpikeStore:
     def __init__(self, db_path: str, batch_size: int = 5000):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        db_path = Path(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
