@@ -14,8 +14,17 @@ from rich.live import Live
 from rich.panel import Panel
 
 OUT = "cta/"
-BASE_PATH = Path("./physionet-motorimagery")
-RECORDS = []
+DATASET_ROOT = Path("./datasets/eegmmidb")
+SFREQ = 160.0
+EEGMMIDB_CHANNELS = [
+    "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+    "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "Fp1", "Fpz", "Fp2", "AF7", "AF3", "AFz",
+    "AF4", "AF8", "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8", "FT7", "FT8", "T7",
+    "T8", "T9", "T10", "TP7", "TP8", "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
+    "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2", "Iz",
+]
+
+RECORDS = sorted(DATASET_ROOT.glob("SUB_*_SIG_*.csv"))
 
 BANDS = {
     "whole": {
@@ -50,16 +59,30 @@ BANDS = {
     },
 }
 
-with open(BASE_PATH / "RECORDS") as f:
-    for line in f:
-        RECORDS.append(line.strip())
-
 def get_subject_data(record):
-    subject = record[5:9]
-    session = record[9:12]
-    raw = mne.io.read_raw_edf(BASE_PATH / subject / f"{subject}{session}.edf", preload=True)
-    raw.notch_filter(freqs=60.0, fir_design='firwin')
-    events, _ = mne.events_from_annotations(raw)
+    signal_path = Path(record)
+    annotation_path = signal_path.with_name(signal_path.name.replace("_SIG_", "_ANN_"))
+
+    signal = np.atleast_2d(np.loadtxt(signal_path, delimiter=",", dtype=float))
+    if signal.shape[1] != len(EEGMMIDB_CHANNELS):
+        raise ValueError(
+            f"Unexpected channel count in {signal_path}: expected {len(EEGMMIDB_CHANNELS)}, got {signal.shape[1]}"
+        )
+
+    data = signal.T * 1e-6
+    info = mne.create_info(ch_names=EEGMMIDB_CHANNELS, sfreq=SFREQ, ch_types="eeg")
+    raw = mne.io.RawArray(data, info, verbose="error")
+    raw.set_montage("standard_1005")
+    raw.set_eeg_reference(projection=True)
+    raw.notch_filter(freqs=60.0, fir_design="firwin")
+
+    annotation_data = np.atleast_2d(np.loadtxt(annotation_path, delimiter=",", dtype=float))
+    onset = (annotation_data[:, 3] - 1) / SFREQ
+    duration = (annotation_data[:, 4] - annotation_data[:, 3] + 1) / SFREQ
+    description = annotation_data[:, 0].astype(int).astype(str)
+
+    raw.set_annotations(mne.Annotations(onset=onset, duration=duration, description=description))
+    events, _ = mne.events_from_annotations(raw, event_id={"1": 1, "2": 2, "3": 3})
     
     return raw, events
 

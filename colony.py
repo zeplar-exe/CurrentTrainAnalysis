@@ -2,6 +2,7 @@ from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, write_
 import mne
 import numpy as np
 import scipy
+from scipy.spatial import KDTree
 from pathlib import Path
 from rich.live import Live
 from rich.panel import Panel
@@ -11,6 +12,7 @@ DATASET_SPECS = {
         "kind": "csv",
         "root": Path("./datasets/eegmmidb"),
         "sfreq": 160.0,
+        "subjects": [f"S{i:03d}" for i in range(1, 103 + 1)],
         "channels": [
             "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
             "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "Fp1", "Fpz", "Fp2", "AF7", "AF3", "AFz",
@@ -44,6 +46,10 @@ BANDS = {
         "low": 1,
         "high": 100,
     },
+    "standard": {
+        "low": 1,
+        "high": 30
+    },
     "theta": {
         "low": 1,
         "high": 4,
@@ -65,6 +71,7 @@ BANDS = {
         "high": 100,
     },
 }
+BANDS = {"standard": BANDS["standard"]}
 
 
 def get_dataset_spec(dataset: str):
@@ -108,16 +115,16 @@ class Colony:
             last_matrix = current_matrix
     
     def raw_weights(self):
-        return self.colony_raw / np.percentile(self.colony_raw, 99)
+        return (self.colony_raw - np.min(self.colony_raw)) / np.percentile(self.colony_raw, 99)
     
     def abs_weights(self):
-        return self.colony_abs / np.percentile(self.colony_abs, 99)
+        return (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99)
     
     def pos_weights(self):
-        return self.colony_pos / np.percentile(self.colony_pos, 99)
+        return (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99)
 
     def neg_weights(self):
-        return self.colony_neg / np.percentile(self.colony_neg, 99)
+        return (self.colony_neg - np.min(self.colony_neg)) / np.percentile(self.colony_neg, 99)
 
 
 def _read_csv_record(record: Path, spec: dict):
@@ -204,6 +211,30 @@ def read_subject_record(dataset, record):
     
     return raw, events
       
+def build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno):
+    lh_coords = src_data[0]['rr'][lh_vertno]
+    rh_coords = src_data[1]['rr'][rh_vertno]
+    n_lh = len(lh_coords)
+    n_rh = len(rh_coords)
+
+    lh_mirrored = lh_coords.copy()
+    lh_mirrored[:, 0] *= -1
+    rh_mirrored = rh_coords.copy()
+    rh_mirrored[:, 0] *= -1
+
+    rh_tree = KDTree(rh_coords)
+    lh_tree = KDTree(lh_coords)
+
+    _, lh_to_rh = rh_tree.query(lh_mirrored)
+    _, rh_to_lh = lh_tree.query(rh_mirrored)
+
+    mirror_map = np.empty(n_lh + n_rh, dtype=int)
+    mirror_map[:n_lh] = lh_to_rh + n_lh
+    mirror_map[n_lh:] = rh_to_lh
+
+    return mirror_map
+
+
 def setup_inverse(dataset, subject, raw_baseline):
     save_file = Path("./inverse") / dataset / subject / "operator.fif"
     save_file.parent.mkdir(parents=True, exist_ok=True)
@@ -237,174 +268,176 @@ def setup_inverse(dataset, subject, raw_baseline):
 
 if __name__ == "__main__":
     with Live(Panel("Initializing...", expand=False), auto_refresh=True) as live:
-        target_subjects = ["S001", "S002", "S003", "S004", "S005", "S006", "S007", "S008", "S009", "S010"][3:]
-        for subject_index, subject in enumerate(target_subjects):
-            subject_baseline_file, subject_active_files = load_subject("eegmmidb", subject)
-            raw_baseline, events_baseline = read_subject_record("eegmmidb", subject_baseline_file)
-            
-            output_dir = Path("./colonies") / "eegmmidb" / subject
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            inv, src, bem = setup_inverse("eegmmidb", subject, raw_baseline)
-            snr = 3.0
-            prepared_inv = prepare_inverse_operator(
-                inv, 
-                nave=1, 
-                lambda2=1.0 / (snr ** 2)
-            )
-            
-            src_data = mne.read_source_spaces(src)
-                    
-            colonies = {}
-            
-            lh_vertno = 0
-            rh_vertno = 0
-            
-            include_raw = False
-            include_abs = False
-            include_pos = True
-            include_neg = True
+        target_datasets = ["eegmmidb"]
+        for dataset_index, dataset in enumerate(target_datasets):
+            spec = get_dataset_spec(dataset)
+            target_subjects = spec["subjects"][:10]
+            for subject_index, subject in enumerate(target_subjects):
+                subject_baseline_file, subject_active_files = load_subject(dataset, subject)
+                raw_baseline, events_baseline = read_subject_record(dataset, subject_baseline_file)
+                
+                output_dir = Path("./colonies") / dataset / subject
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                inv, src, bem = setup_inverse(dataset, subject, raw_baseline)
+                snr = 3.0
+                prepared_inv = prepare_inverse_operator(
+                    inv, 
+                    nave=1, 
+                    lambda2=1.0 / (snr ** 2)
+                )
+                
+                src_data = mne.read_source_spaces(src)
+                        
+                colonies = {}
+                
+                lh_vertno = 0
+                rh_vertno = 0
+                inverse_mirror_map = None
+                
+                include_raw = False
+                include_abs = False
+                include_pos = True
+                include_neg = True
 
-            target_records = subject_active_files[:20]
-            for record_index, record in enumerate(target_records):
-                raw_active, events_active = read_subject_record("eegmmidb", record)
-                
-                grouped_annotations = {}
-                
-                #annotations_active = mne.annotations_from_events(
-                #    events=events_active, 
-                #    sfreq=raw_active.info['sfreq']
-                #)
-                annotations_active = raw_active.annotations
-
-                for annotation in annotations_active:
-                    desc = int(annotation["description"].item().strip())
-                    key = DATASET_SPECS["eegmmidb"]["event_ids"][desc]
+                target_records = subject_active_files[:20]
+                for record_index, record in enumerate(target_records):
+                    raw_active, events_active = read_subject_record(dataset, record)
                     
-                    if key not in grouped_annotations:
-                        grouped_annotations[key] = []
-                    grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
-
-                print(f"Grouped Annotations: {grouped_annotations}")
-                
-                updated_text = f"""Applying inverse solution...
-    Record: {record_index + 1}/{len(target_records)}
-    Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
-                live.update(Panel(updated_text, title="Colony Processing", expand=False))
-                
-                banded_raws = {}
-                banded_stc = {}
-                
-                band_index = 0
-                for band_name, band in BANDS.items():
-                    band_index += 1
-                    low = band["low"]
-                    high = min(band["high"], raw_active.info["sfreq"] / 2.0 - 1)
+                    grouped_annotations = {}
                     
-                    updated_text = f"""Filtering data ({low} Hz - {high} Hz)
-Band: {band_name} ({band_index}/{len(BANDS)})
+                    #annotations_active = mne.annotations_from_events(
+                    #    events=events_active, 
+                    #    sfreq=raw_active.info['sfreq']
+                    #)
+                    annotations_active = raw_active.annotations
+
+                    for annotation in annotations_active:
+                        desc = int(annotation["description"].item().strip())
+                        key = DATASET_SPECS[dataset]["event_ids"][desc]
+                        
+                        if key not in grouped_annotations:
+                            grouped_annotations[key] = []
+                        grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
+
+                    print(f"Grouped Annotations: {grouped_annotations}")
+                    
+                    updated_text = f"""Applying inverse solution...
+Dataset: {dataset} ({dataset_index + 1}/{len(target_datasets)})
 Record: {record_index + 1}/{len(target_records)}
 Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
                     live.update(Panel(updated_text, title="Colony Processing", expand=False))
                     
-                    raw_data = raw_active.copy()
-                    raw_data.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
-                    banded_raws[band_name] = raw_data
-
-                    stc = apply_inverse_raw(
-                        raw_data, 
-                        prepared_inv, 
-                        lambda2=1.0 / (snr ** 2),
-                        buffer_size=5000,
-                        method="dSPM",
-                        prepared=True
-                    )
+                    banded_raws = {}
+                    banded_stc = {}
                     
-                    banded_stc[band_name] = stc
-                
-                sfreq = raw_active.info["sfreq"]
-
-                band_index = 0
-                for band_name, band in BANDS.items():
-                    band_index += 1     
+                    band_index = 0
+                    for band_name, band in BANDS.items():
+                        band_index += 1
+                        low = band["low"]
+                        high = min(band["high"], raw_active.info["sfreq"] / 2.0 - 1)
                         
-                    stc = banded_stc[band_name]
-                    lh_vertno = stc.lh_vertno
-                    rh_vertno = stc.rh_vertno
+                        updated_text = f"""Filtering data ({low} Hz - {high} Hz)
+Band: {band_name} ({band_index}/{len(BANDS)})
+Dataset: {dataset} ({dataset_index + 1}/{len(target_datasets)})
+Record: {record_index + 1}/{len(target_records)}
+Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
+                        live.update(Panel(updated_text, title="Colony Processing", expand=False))
+                        
+                        raw_data = raw_active.copy()
+                        raw_data.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
+                        banded_raws[band_name] = raw_data
 
-                    low = band["low"]
-                    high = min(band["high"], sfreq / 2.0 - 1)
-                
-                    raw_data = banded_raws[band_name]
-                    vertex_data = stc.data
-                    csd_data = mne.preprocessing.compute_current_source_density(raw_data.copy()).get_data()
-                    raw_data = banded_raws[band_name].get_data()
+                        stc = apply_inverse_raw(
+                            raw_data, 
+                            prepared_inv, 
+                            lambda2=1.0 / (snr ** 2),
+                            buffer_size=5000,
+                            method="dSPM",
+                            prepared=True
+                        )
+                        
+                        banded_stc[band_name] = stc
                     
-                    for (source, data) in {"vol": raw_data, "csd": csd_data, "inverse": vertex_data}.items():
-                        for group, annotations in grouped_annotations.items():
-                            updated_text = f"""Processing colony for group: {band_name}
-    Band: {band_name} ({band_index}/{len(BANDS)})
-    Record: {record_index + 1}/{len(target_records)}
-    Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
-                            live.update(Panel(updated_text, title="Colony Processing", expand=False))
-                            
-                            if group not in colonies:
-                                colonies[(source, band_name, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
-                            colony = colonies[(source, band_name, group)]
-                            
-                            for annotation in annotations:
-                                start_sample = int(annotation[0] * sfreq)
-                                end_sample = int(annotation[1] * sfreq)
-                                sample = data[:, start_sample:end_sample]
-                                
-                                if len(sample) < TIMESTEP * sfreq:
-                                    continue
-                                
-                                colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
-                                
-                                # hemispheric mirroring
-                                h = sample.shape[0] // 2
-                                
-                                if h * 2 != sample.shape[0]:
-                                    raise ValueError(f"Sample length must be even, got {sample.shape[0]}")
-                                
-                                fh = sample[:h, :]
-                                sh = sample[h:, :]
-                                
-                                colony.feed(np.vstack([sh, fh]), step=int(TIMESTEP * sfreq), sfreq=sfreq)
+                    sfreq = raw_active.info["sfreq"]
 
-            lh_coordinates = src_data[0]['rr'][lh_vertno]
-            rh_coordinates = src_data[1]['rr'][rh_vertno]
+                    band_index = 0
+                    for band_name, band in BANDS.items():
+                        band_index += 1     
+                            
+                        stc = banded_stc[band_name]
+                        lh_vertno = stc.lh_vertno
+                        rh_vertno = stc.rh_vertno
 
-            all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
-            
-            def write_colony(colony, calc, source, band_name, group):
-                target_dir = output_dir / calc / source / band_name
-                target_dir.mkdir(parents=True, exist_ok=True)
-                with open(target_dir / f"{group}.csv", "w") as f:
-                    if source == "inverse":
-                            f.write("x,y,z,value\n")
-                            for i in range(len(all_xyz_coordinates)):
-                                x, y, z = all_xyz_coordinates[i]
-                                value = colony[i]
-                                f.write(f"{x},{y},{z},{value}\n")
-                    else:
-                        f.write("electrode,value\n")
-                        for i in range(colony.shape[0]):
-                            value = colony[i]
-                            f.write(f"{raw_baseline.ch_names[i]},{value}\n")
+                        if inverse_mirror_map is None:
+                            inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
+
+                        low = band["low"]
+                        high = min(band["high"], sfreq / 2.0 - 1)
+                    
+                        raw_data = banded_raws[band_name]
+                        
+                        vertex_data = stc.data
+                        csd_data = mne.preprocessing.compute_current_source_density(raw_data.copy()).get_data()
+                        raw_data = banded_raws[band_name].get_data()
+                        
+                        for (source, data) in {"vol": raw_data, "csd": csd_data, "inverse": vertex_data}.items():
+                            for group, annotations in grouped_annotations.items():
+                                updated_text = f"""Processing colony for group: {band_name}
+Band: {band_name} ({band_index}/{len(BANDS)})
+Dataset: {dataset} ({dataset_index + 1}/{len(target_datasets)})
+Record: {record_index + 1}/{len(target_records)}
+Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
+                                live.update(Panel(updated_text, title="Colony Processing", expand=False))
+                                
+                                if group not in colonies:
+                                    colonies[(source, band_name, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                                colony = colonies[(source, band_name, group)]
+                                
+                                for annotation in annotations:
+                                    start_sample = int(annotation[0] * sfreq)
+                                    end_sample = int(annotation[1] * sfreq)
+                                    sample = data[:, start_sample:end_sample]
+                                    
+                                    if len(sample) < TIMESTEP * sfreq:
+                                        continue
+                                    
+                                    colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
+
+                                    if source == "inverse":
+                                        mirrored = sample[inverse_mirror_map, :]
+                                        colony.feed(mirrored, step=int(TIMESTEP * sfreq), sfreq=sfreq)
+
+                lh_coordinates = src_data[0]['rr'][lh_vertno]
+                rh_coordinates = src_data[1]['rr'][rh_vertno]
+
+                all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
                 
-            for (source, band_name, group), colony in colonies.items():
-                if include_raw:
-                    write_colony(colony.colony_raw, "raw", source, band_name, group)
-                if include_abs:
-                    write_colony(colony.colony_abs, "abs", source, band_name, group)
-                if include_pos:
-                    write_colony(colony.colony_pos, "pos", source, band_name, group)
-                if include_neg:
-                    write_colony(colony.colony_neg, "neg", source, band_name, group)
-
-# WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
+                def write_colony(colony, calc, source, band_name, group):
+                    target_dir = output_dir / calc / source / band_name
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    with open(target_dir / f"{group}.csv", "w") as f:
+                        if source == "inverse":
+                                f.write("x,y,z,value\n")
+                                for i in range(len(all_xyz_coordinates)):
+                                    x, y, z = all_xyz_coordinates[i]
+                                    value = colony[i]
+                                    f.write(f"{x},{y},{z},{value}\n")
+                        else:
+                            f.write("electrode,value\n")
+                            for i in range(colony.shape[0]):
+                                value = colony[i]
+                                f.write(f"{raw_baseline.ch_names[i]},{value}\n")
+                    
+                for (source, band_name, group), colony in colonies.items():
+                    if include_raw:
+                        write_colony(colony.colony_raw, "raw", source, band_name, group)
+                    if include_abs:
+                        write_colony(colony.colony_abs, "abs", source, band_name, group)
+                    if include_pos:
+                        write_colony(colony.colony_pos, "pos", source, band_name, group)
+                    if include_neg:
+                        write_colony(colony.colony_neg, "neg", source, band_name, group)
 
 # + we need to set this up as a reusable funciton that is agnostic to input stream (raw vs csd vs inverse)
 # + we need to set this up to run on all of the records and beyond
@@ -419,6 +452,7 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # - what about snr and lambda2?
 # - should we test out sLORETTA or does that not work with our setup?
 
+
 # btw: inverse is kinda easiest for cross-dataset decoding
     # but we should do both cross-dataset (inverse only) and same-dataset (raw, inverse, and csd)
 # we gotta find papers that implement raw, csd, or inverse decoders and see if this selection method improves things
@@ -431,11 +465,27 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # as in: give epochs of multiple events, so you know what electrodes are generally shared and active
 # any good classifier with this should give a probability for the given event to occur
     # we can do a multi-class probability decoder with this via combination of multiple binary classifiers, one per event
-# small distribution (in a band or otherwise) of total gain implies that there's not much discrimination, how filter?
+
+# WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
+# also: let's just find the 32, 64, 128 datasets we want to use so we're not limited to MI
+    # refactor _read_csv_record to be eegmbdi-specific (remove the glob in the spec and put it here)
+# for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
+# ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
+# how do we choose when to mirror and when not to mirror during colony growth?
+# looks like we have an unsupervised clusterer on our hands: test by collecting colony on some arbitrary event (or relaxation) 
+    # and then do a comparison with CSD & Inverse on the arbitrary epoch and the coalesced colony
+        # (we need to test all Vol/CSD/Inverse combinations) to get the match percentage/probability
+            # would also need to implement the weighting of the coalesced colony someway
+            # also: do we mirror the input epoch? I guess so; you could test with/without
+        # oh, we should do this per-band too, to see if the band has an effect on the accuracy
+    # cause: inverse handles spatial densities; CSD handles dipoles and provides another form of localization
+# HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
+# after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
+
 
 # what about the path idea by the way?
     # we can do a 2nd pass using the top n% vertices and then go through every window and get the average activations temporally
-# also also, when we have more events, we should cut out the broadband noise that appears in every single one
+# also also, when we have more events, we should cut out the broadband noise that appears in every single one to see if accuracy can improve without cutting the truly valuable electrodes
 
 
 # anywho: a second report is on the amount of vertex overlap (top 5, 15, 25, 50 vertices) per-event within and across subjects and bands
@@ -457,7 +507,8 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # using (a-b)/b because occipital lobe was fucking things up with constant, relatively small changes, so now gain is relative to the baseline itself
         # this does mean a baseline close to zero can cause a spike, mitigated by averaging and sample size
     # hemispheric mirroring to deal with general lateralization
-        # for anything that is heavily lateralized to one side, this hurts btw
+        # for anything that is heavily lateralized to one side this hurts btw (aka, no generalizability here)
+    # using different bands because some events respond better on different bands (again, no generalizability)
 
 # for rigor: report skewness on our colony files
     # claude says skewness coefficient is effect size and fine on its own (since n is large)
@@ -466,3 +517,16 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # / variance is noise
 # Gini coefficient: measures concentration. 0 = perfectly uniform (every vertex equal), 1 = all value in one vertex.
 # get % of the total gain across all electrodes/vertices is handled by per percentile
+
+# we can include some of the coalesced colonies
+    # for ex: (for alpha) show that the inverses of the hand grip events are massively red in the frontal cortex while the CSD show contralateralization
+    # for ex: (for alpha) show that the inverses of the imagined hand grip events are massively red in the frontal cortex while the CSD show ipsilateralization
+        # we should probably confirm this with, you guessed it, a literature review
+        
+        
+
+# what about generalization?
+    # we know that the occipital lobe takes the cake a lot, so via state machine or something, determine that occipital needs to be removed... somehow
+    # also: do you reckon we can calculate per-lobe density? for state machining (somehow)
+        # alternatively, we could just kill a lobe we don't want for a certain event (ad hoc choice... should be customizable)
+    # and: how do we manage lateralization? we're still flatly doing mirroring everywhere...

@@ -21,6 +21,12 @@ class Sterotype:
         self._summation += windowed_epoch * self.weights[:, np.newaxis]
         self._count += 1
     
+    # jitter parameters...
+        # delay?
+        # max amplitude? how do we vary amplitude? scaled vs alternating low and high?
+        # phase? how do we vary phase? scaled vs alternating low and high? constant?
+        # wavelength? how do we vary wavelength? scaled vs alternating low and high?
+        # random gaps in between? how do we vary lengths? constant vs gradient?
     def get_path(self):
         if self._count == 0:
             return None

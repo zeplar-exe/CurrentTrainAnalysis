@@ -9,9 +9,11 @@ import itertools
 from pathlib import Path
 import keras
 from hmmlearn import hmm
+import torch
 from umap.parametric_umap import ParametricUMAP
 from sklearn.decomposition import IncrementalPCA
 from colony import DATASET_SPECS, load_subject, read_subject_record, setup_inverse
+from denstream import DenStream
 
 SEED = 42
 UMAP_COMPONENTS = 100
@@ -42,44 +44,27 @@ def collect(data: np.ndarray, step: int, sfreq: int):
     
     return raw_growth, pos_growth, neg_growth
 
-def cluster(cluster_samples):
-    pca = IncrementalPCA(n_components=PCA_COMPONENTS) #random_state=SEED
-    reduced = None
-    sample_length = None
-    
-    for sample in cluster_samples:
-        if not sample_length:
-            sample_length = sample.shape[1]
-        elif sample_length != sample.shape[1]:
-            raise ValueError(f"All samples must have the same length, but got {sample_length} and {sample.shape[1]}")
-        pca.partial_fit(sample)
-    
-    for sample in cluster_samples:
-        if reduced is None:
-            reduced = pca.transform(sample).astype(np.float32)
-        else:
-            reduced = np.hstack([reduced, pca.transform(sample).astype(np.float32)])
-    
-    print(f"PCA: {PCA_COMPONENTS} components retain {pca.explained_variance_ratio_.sum():.2%} of variance")
-    
-    states = 50
-    model = hmm.GaussianHMM(
-        n_components=states,        # number of hidden states (sweep this)
-        covariance_type="diag", # "full" is richer but needs more data per state
-        n_iter=200,            # EM iterations
-        random_state=SEED
+def cluster(train_samples):
+    model = DenStream(
+        epsilon=0.3,      # neighborhood radius for micro-clusters
+        beta=0.2,         # outlier threshold (micro-cluster weight below beta*mu = outlier)
+        mu=10,            # minimum weight for a micro-cluster to be "potential" (real)
+        lambd=0.001,      # decay factor (set near-zero since your data isn't temporal priority)
+        min_samples=5     # minimum points for DBSCAN in the macro-clustering step
     )
-    model.fit(reduced, lengths=[sample_length] * len(cluster_samples))
     
-    templates = model.means_
-    states = model.predict(reduced)
-    transitions = model.transmat_
-    
-    log_likelihood = model.score(reduced)
-    n_params = states * 200 + states * 200 + states * states  # means + covars(diag) + transitions
-    bic = -2 * log_likelihood * len(reduced) + n_params * np.log(len(reduced))
+    model.fit_generator(train_samples)
+    return model
 
-def generate_sphere_centers(coordinates: np.ndarray, r: float):
+def predict(model: DenStream, points: np.ndarray):
+    labels = model._request_clustering()
+    if len(labels) == 0:
+        return np.full(points.shape[0], -1, dtype=np.int32)
+    centers = np.concatenate([c.center for c in model.p_micro_clusters], axis=0)
+    closest = np.argmin(np.linalg.norm(points[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2), axis=1)
+    return labels[closest]
+
+def generate_sphere_centers(coordinates: np.ndarray, r: float, k: int):
     tree = KDTree(coordinates)
     center = coordinates.mean(axis=0)
     step = r / 2
@@ -95,14 +80,16 @@ def generate_sphere_centers(coordinates: np.ndarray, r: float):
     queue.append(center)
 
     centers = []
+    indices = []
 
     while queue:
         point = queue.popleft()
-        neighbors = tree.query_ball_point(point, r)
-        if len(neighbors) == 0:
+        if len(tree.query_ball_point(point, r)) == 0:
             continue
 
+        _, knn_idx = tree.query(point, k=k)
         centers.append(point)
+        indices.append(knn_idx)
 
         for axis in range(3):
             for direction in (-1, 1):
@@ -113,11 +100,11 @@ def generate_sphere_centers(coordinates: np.ndarray, r: float):
                     visited.add(key)
                     queue.append(neighbor)
 
-    return np.array(centers)
+    return np.array(centers), np.array(indices)
 
 def generate_subject_data():
     target_subjects = {
-        "eegmmidb": ["S001", "S002", "S003", "S004", "S005", "S006", "S007", "S008", "S009", "S010"][6:],
+        "eegmmidb": ["S001", "S002", "S003", "S004", "S005", "S006", "S007", "S008", "S009", "S010"],
     }
 
     for dataset, subjects in target_subjects.items():
@@ -218,6 +205,15 @@ if __name__ == "__main__":
 
 # + gotta fix the inhomogenous arrays (presumably due to different sized events)
 # gotta do a bunch of aggregation types (same subject, same event, same dataset...) into the HMM
-# gotta figure out how many states is useful in the HMM (score sweeping?)
 # + gotta select equidistant, all-encompassing spheres/vertex centers instead of random
-# gotta be able to visualize the HMM states in the brain
+# gotta be able to visualize the clusters in their spheres (approximated? export with coordinates?)
+
+# one thing: are we ever going to take bands into account here? probably should, right?
+# oh boy... how are we going to mass run all of these?
+# so, we need to have a loader to get all or some (random sample?) of the growth/ data to put into the model
+# once the model is fitted on all of that, we can then 1) check the clusters in a 3d view/animation (cause it's over time)
+# then, we can do inference on either new or same data to determine what clusters fall under events
+# then, IF the events have meaningfully common/different events from each other AND from the relaxation/non-event states
+    # then we can test those events (weighted? linear combinations) for discrimination between events and get probabilities
+# also, we need some way to keep track of localization of clusters for event discrimination (a sphere in the temporal vs in the parietal for ex)
+# and everything should be invariant to dataset/subjects (new datasets should have resting periods)

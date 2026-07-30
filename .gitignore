@@ -2,4 +2,11 @@ figures/
 datasets/
 .vscode/
 colonies/
+coalesce/
 inverse/
+__pycache__
+growth/
+growth
+colonies
+datasets
+coalesce
