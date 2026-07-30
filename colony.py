@@ -1,38 +1,43 @@
-from analyze import get_subject_data, RECORDS
-from mne.minimum_norm import apply_inverse_raw, write_inverse_operator, read_inverse_operator, make_inverse_operator
+from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, write_inverse_operator, read_inverse_operator, make_inverse_operator
 import mne
 import numpy as np
 import scipy
 from pathlib import Path
+from rich.live import Live
+from rich.panel import Panel
 
-class Colony:
-    DEVIATION_RESOLUTION = 5.0 # s
-    
-    def __init__(self, size: int, include_raw: bool = True, include_abs: bool = True, include_pos: bool = True):
-        self.include_raw = include_raw
-        self.include_abs = include_abs
-        self.include_pos = include_pos
-        self.colony_raw = np.zeros(size)
-        self.colony_abs = np.zeros(size)
-        self.colony_pos = np.zeros(size)
-        
-    def feed(self, data: np.ndarray, step: int):
-        a = np.abs(scipy.signal.hilbert(data))
-        b = scipy.ndimage.uniform_filter1d(a, size=int(Colony.DEVIATION_RESOLUTION * sfreq), axis=1)
-        data = a-b
-            
-        last_matrix = np.nan_to_num(data[:, 0:step].mean(axis=1), nan=0.0)
-        for i in np.arange(1, np.floor(data.shape[1] / step)):
-            start_time = int(i * step)
-            end_time = int(min((i + 1) * step, data.shape[1]))
-            current_matrix = np.nan_to_num(data[:, start_time:end_time].mean(axis=1), nan=0.0)
-            if self.include_raw:
-                self.colony_raw += current_matrix - last_matrix
-            if self.include_abs:
-                self.colony_abs += np.abs(current_matrix - last_matrix)
-            if self.include_pos:
-                self.colony_pos += np.maximum(current_matrix - last_matrix, 0)
-            last_matrix = current_matrix
+DATASET_SPECS = {
+    "eegmmidb": {
+        "kind": "csv",
+        "root": Path("./datasets/eegmmidb"),
+        "sfreq": 160.0,
+        "channels": [
+            "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+            "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "Fp1", "Fpz", "Fp2", "AF7", "AF3", "AFz",
+            "AF4", "AF8", "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8", "FT7", "FT8", "T7",
+            "T8", "T9", "T10", "TP7", "TP8", "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
+            "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2", "Iz",
+        ],
+        "run_glob": "SUB_{subject_id}_SIG_*.csv",
+        "event_ids": {
+            1: "task1_relax",
+            2: "task1_real_left_fist",
+            3: "task1_real_right_fist",
+            4: "task2_relax",
+            5: "task2_imagine_left_fist",
+            6: "task2_imagine_right_fist",
+            7: "task3_relax",
+            8: "task3_real_both_fists",
+            9: "task3_real_both_feet",
+            10: "task4_relax",
+            11: "task4_imagine_both_fists",
+            12: "task4_imagine_both_feet",
+        },
+        "ignore_events": [1, 4, 7, 10]
+    },
+}
+
+TIMESTEP = 50 / 1000 # s
 
 BANDS = {
     "whole": {
@@ -61,38 +66,116 @@ BANDS = {
     },
 }
 
-EVENT_IDS = {
-    "physionet": {
-        1: "T0",
-        2: "T1",
-        3: "T2"
-    }
-}
 
-TIMESTEP = 50 / 1000 # s
-ASSUMED_EVENT_LENGTH = 800 / 1000 # s
+def get_dataset_spec(dataset: str):
+    try:
+        return DATASET_SPECS[dataset]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported dataset: {dataset}") from exc
+
+
+class Colony:
+    DEVIATION_RESOLUTION = 2.0 # s
+    
+    def __init__(self, size: int, include_raw: bool = False, include_abs: bool = False, include_pos: bool = False, include_neg: bool = False):
+        self.include_raw = include_raw
+        self.include_abs = include_abs
+        self.include_pos = include_pos
+        self.include_neg = include_neg
+        self.colony_raw = np.zeros(size)
+        self.colony_abs = np.zeros(size)
+        self.colony_pos = np.zeros(size)
+        self.colony_neg = np.zeros(size)
+        
+    def feed(self, data: np.ndarray, step: int, sfreq: int):
+        a = np.abs(scipy.signal.hilbert(data))
+        b = scipy.ndimage.uniform_filter1d(a, size=int(Colony.DEVIATION_RESOLUTION * sfreq), axis=1)
+        data = (a-b)/b
+            
+        last_matrix = np.nan_to_num(data[:, 0:step].mean(axis=1), nan=0.0)
+        for i in np.arange(1, np.floor(data.shape[1] / step)):
+            start_time = int(i * step)
+            end_time = int(min((i + 1) * step, data.shape[1]))
+            current_matrix = np.nan_to_num(data[:, start_time:end_time].mean(axis=1), nan=0.0)
+            if self.include_raw:
+                self.colony_raw += current_matrix - last_matrix
+            if self.include_abs:
+                self.colony_abs += np.abs(current_matrix - last_matrix)
+            if self.include_pos:
+                self.colony_pos += np.maximum(current_matrix - last_matrix, 0)
+            if self.include_neg:
+                self.colony_neg += np.minimum(last_matrix - current_matrix, 0)
+            last_matrix = current_matrix
+    
+    def raw_weights(self):
+        return self.colony_raw / np.percentile(self.colony_raw, 99)
+    
+    def abs_weights(self):
+        return self.colony_abs / np.percentile(self.colony_abs, 99)
+    
+    def pos_weights(self):
+        return self.colony_pos / np.percentile(self.colony_pos, 99)
+
+    def neg_weights(self):
+        return self.colony_neg / np.percentile(self.colony_neg, 99)
+
+
+def _read_csv_record(record: Path, spec: dict):
+    signal_path = Path(record)
+    annotation_path = signal_path.with_name(signal_path.name.replace("_SIG_", "_ANN_"))
+
+    signal = np.atleast_2d(np.loadtxt(signal_path, delimiter=",", dtype=float))
+    if signal.shape[1] != len(spec["channels"]):
+        raise ValueError(
+            f"Unexpected channel count in {signal_path}: expected {len(spec['channels'])}, got {signal.shape[1]}"
+        )
+
+    raw = mne.io.RawArray(signal.T * 1e-6, mne.create_info(spec["channels"], spec["sfreq"], ch_types="eeg"), verbose="error")
+    raw.set_montage("standard_1005")
+    raw.set_eeg_reference(projection=True)
+
+    annotation_data = np.atleast_2d(np.loadtxt(annotation_path, delimiter=",", dtype=float))
+    annotation_data = annotation_data[~np.isin(annotation_data[:, 0], spec.get("ignore_events", [])), :]
+    onset = (annotation_data[:, 3] - 1) / spec["sfreq"]
+    duration = (annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"]
+    description = annotation_data[:, 0].astype(int).astype(str)
+    
+    raw.set_annotations(mne.Annotations(onset=onset, duration=duration, description=description))
+    events = np.column_stack(
+        [
+            annotation_data[:, 3].astype(int) - 1,
+            np.zeros(len(annotation_data), dtype=int),
+            annotation_data[:, 0].astype(int),
+        ]
+    )
+
+    return raw, events
 
 def load_subject(dataset, subject):
-    if dataset == "physionet":
-        r = []
-        
-        for record in RECORDS:
-            subject = record[5:9]
-            session = record[9:12]
-            
-            if subject == subject:
-                r.append(Path("./physionet-motorimagery") / subject / f"{subject}{session}.edf")
-        
-        if not r:
-            raise ValueError(f"Subject {subject} not found in dataset {dataset}")
-        
-        record_baseline = r[0]
-        
-        return record_baseline, r[2:]
+    spec = get_dataset_spec(dataset)
+    subject_id = subject[1:] if subject.startswith("S") else subject
+    runs = sorted(spec["root"].glob(spec["run_glob"].format(subject_id=subject_id)))
+
+    if not runs:
+        raise ValueError(f"Subject {subject} not found in dataset {dataset}")
+
+    if dataset == "eegmmidb":
+        return runs[0], runs[2:]
+    else:
+        return runs[0], runs[1:]
     
 def fix_raw(dataset, raw):
     raw.notch_filter(freqs=60.0, fir_design='firwin')
     
+    ica = mne.preprocessing.ICA(n_components=0.995, method='fastica')
+    ica.fit(raw.copy().filter(1, min(100, raw.info["sfreq"] / 2 - 1), fir_design='firwin'))
+    muscle_idx, scores = ica.find_bads_muscle(raw)
+    ica.exclude = muscle_idx
+    raw = ica.apply(raw.copy())
+    
+    if dataset == "eegmmidb":
+        raw = raw
+
     if dataset == "physionet":
         case_fixing_map = {
             'Fc5': 'FC5', 'Fc3': 'FC3', 'Fc1': 'FC1', 'Fcz': 'FCz', 'Fc2': 'FC2', 'Fc4': 'FC4', 'Fc6': 'FC6',
@@ -107,11 +190,17 @@ def fix_raw(dataset, raw):
         raw.rename_channels(case_fixing_map)
         raw.set_montage('standard_1005')
         raw.set_eeg_reference(projection=True)
+        
+    return raw
 
 def read_subject_record(dataset, record):
-    raw = mne.io.read_raw_edf(record, preload=True)
+    spec = get_dataset_spec(dataset)
+    if spec["kind"] == "csv":
+        raw, events = _read_csv_record(record, spec)
+    else:
+        raise ValueError(f"Unsupported dataset kind: {spec['kind']}")
+
     fix_raw(dataset, raw)
-    events, _ = mne.events_from_annotations(raw)
     
     return raw, events
       
@@ -144,149 +233,191 @@ def setup_inverse(dataset, subject, raw_baseline):
     
     write_inverse_operator(save_file, inverse_operator, overwrite=True)
     
-    return inverse_operator, src, bem
-    
+    return inverse_operator, src, bem 
 
-for subject in ["S001", "S002", "S003"]:
-    print("Processing inverse and colonies for subject:", subject)
-    subject_baseline_file, subject_active_files = load_subject("physionet", subject)
-    raw_baseline, events_baseline = read_subject_record("physionet", subject_baseline_file)
-    
-    output_dir = Path("./colonies") / "physionet" / subject
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    inv, src, bem = setup_inverse("physionet", subject, raw_baseline)
+if __name__ == "__main__":
+    with Live(Panel("Initializing...", expand=False), auto_refresh=True) as live:
+        target_subjects = ["S001", "S002", "S003", "S004", "S005", "S006", "S007", "S008", "S009", "S010"][3:]
+        for subject_index, subject in enumerate(target_subjects):
+            subject_baseline_file, subject_active_files = load_subject("eegmmidb", subject)
+            raw_baseline, events_baseline = read_subject_record("eegmmidb", subject_baseline_file)
             
-    colonies = {}
-    
-    lh_vertno = 0
-    rh_vertno = 0
-
-    for record in subject_active_files[:3]:
-        raw_active, events_active = read_subject_record("physionet", record)
-    
-        snr = 3.0
-        stc = apply_inverse_raw(
-            raw_active, 
-            inv, 
-            lambda2=1.0 / (snr ** 2),
-            buffer_size=5000,
-            method="dSPM", 
-            pick_ori=None
-        )
-        
-        lh_vertno = stc.lh_vertno
-        rh_vertno = stc.rh_vertno
-
-        sfreq = raw_active.info["sfreq"]
-        grouped_annotations = {}
-
-        annotations_active = mne.annotations_from_events(
-            events=events_active, 
-            sfreq=raw_active.info['sfreq']
-        )
-
-        for annotation in annotations_active:
-            desc = int(annotation["description"].item().strip())
-            key = EVENT_IDS["physionet"][desc]
+            output_dir = Path("./colonies") / "eegmmidb" / subject
+            output_dir.mkdir(parents=True, exist_ok=True)
             
-            if key not in grouped_annotations:
-                grouped_annotations[key] = []
-            grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + ASSUMED_EVENT_LENGTH))
-
-        print(f"Grouped Annotations: {grouped_annotations}")
-
-        for band_name, band in BANDS.items():
-            print(f"Processing colony on band: {band_name}")
-            low = band["low"]
-            high = min(band["high"], sfreq / 2.0 - 1)
-            vertex_data = mne.filter.filter_data(
-                stc.copy().data, 
-                sfreq=sfreq, 
-                l_freq=low, 
-                h_freq=high, 
-                fir_design='firwin'
+            inv, src, bem = setup_inverse("eegmmidb", subject, raw_baseline)
+            snr = 3.0
+            prepared_inv = prepare_inverse_operator(
+                inv, 
+                nave=1, 
+                lambda2=1.0 / (snr ** 2)
             )
             
-            raw_data = raw_active.copy()
-            raw_data.filter(l_freq=low, h_freq=high, fir_design='firwin')
-            raw_data = raw_data.get_data()
-            
-            csd_data = mne.preprocessing.compute_current_source_density(raw_active.copy())
-            csd_data.filter(l_freq=low, h_freq=high, fir_design='firwin')
-            csd_data = csd_data.get_data()
-            
-            for (source, data) in {"raw": raw_data, "csd": csd_data, "inverse": vertex_data}.items():
-                for group, annotations in grouped_annotations.items():
-                    if group not in colonies:
-                        colonies[(source, band_name, group)] = Colony(data.shape[0], include_raw=True, include_abs=True, include_pos=True)
-                    print(f"Processing colony for group: {group}")
-                    colony = colonies[(source, band_name, group)]
+            src_data = mne.read_source_spaces(src)
                     
-                    for annotation in annotations:
-                        start_sample = int(annotation[0] * sfreq)
-                        end_sample = int(annotation[1] * sfreq)
-                        colony.feed(data[:, start_sample:end_sample], step=int(TIMESTEP * sfreq))
-    
-    src_data = mne.read_source_spaces(src)
+            colonies = {}
+            
+            lh_vertno = 0
+            rh_vertno = 0
+            
+            include_raw = False
+            include_abs = False
+            include_pos = True
+            include_neg = True
 
-    lh_coordinates = src_data[0]['rr'][lh_vertno]
-    rh_coordinates = src_data[1]['rr'][rh_vertno]
+            target_records = subject_active_files[:20]
+            for record_index, record in enumerate(target_records):
+                raw_active, events_active = read_subject_record("eegmmidb", record)
+                
+                grouped_annotations = {}
+                
+                #annotations_active = mne.annotations_from_events(
+                #    events=events_active, 
+                #    sfreq=raw_active.info['sfreq']
+                #)
+                annotations_active = raw_active.annotations
 
-    all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
-        
-    for (source, band_name, group), colony in colonies.items():
-        event_name = EVENT_IDS["physionet"][group]
-        with open(output_dir / f"colony_raw_{event_name}_{band_name}.csv", "w") as f:
-            f.write("x,y,z,value\n")
-            for i in range(len(all_xyz_coordinates)):
-                x, y, z = all_xyz_coordinates[i]
-                value = colony.colony_raw[i]
-                f.write(f"{x},{y},{z},{value}\n")
-        with open(output_dir / f"colony_abs_{event_name}_{band_name}.csv", "w") as f:
-            f.write("x,y,z,value\n")
-            for i in range(len(all_xyz_coordinates)):
-                x, y, z = all_xyz_coordinates[i]
-                value = colony.colony_abs[i]
-                f.write(f"{x},{y},{z},{value}\n")
-        with open(output_dir / f"colony_pos_{event_name}_{band_name}.csv", "w") as f:
-            f.write("x,y,z,value\n")
-            for i in range(len(all_xyz_coordinates)):
-                x, y, z = all_xyz_coordinates[i]
-                value = colony.colony_pos[i]
-                f.write(f"{x},{y},{z},{value}\n")
+                for annotation in annotations_active:
+                    desc = int(annotation["description"].item().strip())
+                    key = DATASET_SPECS["eegmmidb"]["event_ids"][desc]
+                    
+                    if key not in grouped_annotations:
+                        grouped_annotations[key] = []
+                    grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
+
+                print(f"Grouped Annotations: {grouped_annotations}")
+                
+                updated_text = f"""Applying inverse solution...
+    Record: {record_index + 1}/{len(target_records)}
+    Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
+                live.update(Panel(updated_text, title="Colony Processing", expand=False))
+                
+                banded_raws = {}
+                banded_stc = {}
+                
+                band_index = 0
+                for band_name, band in BANDS.items():
+                    band_index += 1
+                    low = band["low"]
+                    high = min(band["high"], raw_active.info["sfreq"] / 2.0 - 1)
+                    
+                    updated_text = f"""Filtering data ({low} Hz - {high} Hz)
+Band: {band_name} ({band_index}/{len(BANDS)})
+Record: {record_index + 1}/{len(target_records)}
+Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
+                    live.update(Panel(updated_text, title="Colony Processing", expand=False))
+                    
+                    raw_data = raw_active.copy()
+                    raw_data.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
+                    banded_raws[band_name] = raw_data
+
+                    stc = apply_inverse_raw(
+                        raw_data, 
+                        prepared_inv, 
+                        lambda2=1.0 / (snr ** 2),
+                        buffer_size=5000,
+                        method="dSPM",
+                        prepared=True
+                    )
+                    
+                    banded_stc[band_name] = stc
+                
+                sfreq = raw_active.info["sfreq"]
+
+                band_index = 0
+                for band_name, band in BANDS.items():
+                    band_index += 1     
+                        
+                    stc = banded_stc[band_name]
+                    lh_vertno = stc.lh_vertno
+                    rh_vertno = stc.rh_vertno
+
+                    low = band["low"]
+                    high = min(band["high"], sfreq / 2.0 - 1)
+                
+                    raw_data = banded_raws[band_name]
+                    vertex_data = stc.data
+                    csd_data = mne.preprocessing.compute_current_source_density(raw_data.copy()).get_data()
+                    raw_data = banded_raws[band_name].get_data()
+                    
+                    for (source, data) in {"vol": raw_data, "csd": csd_data, "inverse": vertex_data}.items():
+                        for group, annotations in grouped_annotations.items():
+                            updated_text = f"""Processing colony for group: {band_name}
+    Band: {band_name} ({band_index}/{len(BANDS)})
+    Record: {record_index + 1}/{len(target_records)}
+    Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
+                            live.update(Panel(updated_text, title="Colony Processing", expand=False))
+                            
+                            if group not in colonies:
+                                colonies[(source, band_name, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                            colony = colonies[(source, band_name, group)]
+                            
+                            for annotation in annotations:
+                                start_sample = int(annotation[0] * sfreq)
+                                end_sample = int(annotation[1] * sfreq)
+                                sample = data[:, start_sample:end_sample]
+                                
+                                if len(sample) < TIMESTEP * sfreq:
+                                    continue
+                                
+                                colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
+                                
+                                # hemispheric mirroring
+                                h = sample.shape[0] // 2
+                                
+                                if h * 2 != sample.shape[0]:
+                                    raise ValueError(f"Sample length must be even, got {sample.shape[0]}")
+                                
+                                fh = sample[:h, :]
+                                sh = sample[h:, :]
+                                
+                                colony.feed(np.vstack([sh, fh]), step=int(TIMESTEP * sfreq), sfreq=sfreq)
+
+            lh_coordinates = src_data[0]['rr'][lh_vertno]
+            rh_coordinates = src_data[1]['rr'][rh_vertno]
+
+            all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
+            
+            def write_colony(colony, calc, source, band_name, group):
+                target_dir = output_dir / calc / source / band_name
+                target_dir.mkdir(parents=True, exist_ok=True)
+                with open(target_dir / f"{group}.csv", "w") as f:
+                    if source == "inverse":
+                            f.write("x,y,z,value\n")
+                            for i in range(len(all_xyz_coordinates)):
+                                x, y, z = all_xyz_coordinates[i]
+                                value = colony[i]
+                                f.write(f"{x},{y},{z},{value}\n")
+                    else:
+                        f.write("electrode,value\n")
+                        for i in range(colony.shape[0]):
+                            value = colony[i]
+                            f.write(f"{raw_baseline.ch_names[i]},{value}\n")
+                
+            for (source, band_name, group), colony in colonies.items():
+                if include_raw:
+                    write_colony(colony.colony_raw, "raw", source, band_name, group)
+                if include_abs:
+                    write_colony(colony.colony_abs, "abs", source, band_name, group)
+                if include_pos:
+                    write_colony(colony.colony_pos, "pos", source, band_name, group)
+                if include_neg:
+                    write_colony(colony.colony_neg, "neg", source, band_name, group)
 
 # WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
 
-# we need to set this up as a reusable funciton that is agnostic to input stream (raw vs csd vs inverse)
-# we need to set this up to run on all of the records and beyond
-    # we also need to aggregate same event across all subjects (this is a per-dataset thing) 
-# we need to store the forward model for fast reload; but does it change across subjects or datasets?
-# we need to see if strongest vertices across bands are the same or not
+# + we need to set this up as a reusable funciton that is agnostic to input stream (raw vs csd vs inverse)
+# + we need to set this up to run on all of the records and beyond
+    # we also need to aggregate same event across all subjects (this is a per head model thing) 
+# + we need to store the forward model for fast reload; but does it change across subjects or datasets?
+# + we need to see if strongest vertices across bands are the same or not
+    # / they do, in fact, have a bit of non-overlap, depending on the band
     # if not, that increases our feature space, kinda; will have to test with a decoder 
     # where we include vertex data at certain frequency band; this allow duplicate
     # vertices at different bands
-# also need to experiment with the timestep, event length, deviation resolution a bit
-    # waht about snr and lambda2
-    # should we test out sLORETTA or does that not work with our setup?
-
-# and I guess for choosing which colonies to keep
-    # mean should be greater than median (right skewed)
-    # skewness should be at least medium (at least 0.4?)
-# for rigor: report skewness on our colony files
-    # claude says skewness coefficient is effect size and fine on its own (since n is large)
-    # should go ahead and confirm this
-
-# anywho: a second report is on the amount of vertex overlap (top 5, 10, 25, 50 vertices) per-event within and across subjects
-    # this only applies to the abs and pos colonies
-    # we can show that the raw deviation colonies skew *left* and are not very useful
-        # claude: apparently this means that most of the cortex is desynchronized (ERD) 
-        # and focal sync (ERS) takes over... I don't buy, will have to research
-    # "a Jaccard matrix across bands, one number per pair, immediately readable"
-        # what?
-
-# The tail ratio: what fraction of total variance/power is carried by the top 10%, 25%, 50% of vertices?
-# Gini coefficient: measures concentration. 0 = perfectly uniform (every vertex equal), 1 = all value in one vertex.
+# + also need to experiment with the timestep, deviation resolution a bit
+    # - what about snr and lambda2?
+# - should we test out sLORETTA or does that not work with our setup?
 
 # btw: inverse is kinda easiest for cross-dataset decoding
     # but we should do both cross-dataset (inverse only) and same-dataset (raw, inverse, and csd)
@@ -296,11 +427,42 @@ for subject in ["S001", "S002", "S003"]:
     # can retrain with training data weighted perhaps? 
 # The comparison to Fisher-score selection or anatomical selection on the same decoders is a result
     # any others I should know about for testing?
+# consider: this is a binary encoder for 1 singular type of event, though it can be expended to multi-event
+    # as in: give epochs of multiple events, so you know what electrodes are generally shared and active
+# any good classifier with this should give a probability for the given event to occur
+    # we can do a multi-class probability decoder with this via combination of multiple binary classifiers, one per event
+# small distribution (in a band or otherwise) of total gain implies that there's not much discrimination, how filter?
+
+# what about the path idea by the way?
+    # we can do a 2nd pass using the top n% vertices and then go through every window and get the average activations temporally
+# also also, when we have more events, we should cut out the broadband noise that appears in every single one
+
+
+# anywho: a second report is on the amount of vertex overlap (top 5, 15, 25, 50 vertices) per-event within and across subjects and bands
+    # this only applies to the abs and pos colonies
+    # we can show that the raw deviation colonies skew *left* and are not very useful
+        # claude: apparently this means that most of the cortex is desynchronized (ERD) 
+        # and focal sync (ERS) takes over... I don't buy, will have to research
+    # "a Jaccard matrix across bands, one number per pair, immediately readable"
+        # what?
 
 # null result #1: there is no discernible differene in vertex firings
     # already proven false
 # null result #2: feature selection in this way has no significant effect on accuracy
 
-# what about the path idea by the way?
-    # we can do a 2nd pass using the top n% vertices and then go through every window and get the average activations temporally
-# also also, when we have more events, we should cut out the broadband noise that appears in every single one
+
+# methods notes: 
+    # ICA to kill random shit
+    # we're sticking with dMSB https://sdgsreview.org/LifestyleJournal/article/view/7511
+    # using (a-b)/b because occipital lobe was fucking things up with constant, relatively small changes, so now gain is relative to the baseline itself
+        # this does mean a baseline close to zero can cause a spike, mitigated by averaging and sample size
+    # hemispheric mirroring to deal with general lateralization
+        # for anything that is heavily lateralized to one side, this hurts btw
+
+# for rigor: report skewness on our colony files
+    # claude says skewness coefficient is effect size and fine on its own (since n is large)
+    # should go ahead and confirm this
+# - The tail ratio: what fraction of total variance/power is carried by the top 10%, 25%, 50% of vertices?
+    # / variance is noise
+# Gini coefficient: measures concentration. 0 = perfectly uniform (every vertex equal), 1 = all value in one vertex.
+# get % of the total gain across all electrodes/vertices is handled by per percentile
