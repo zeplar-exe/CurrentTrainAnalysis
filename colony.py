@@ -482,6 +482,7 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 # HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
 # after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
 
+# also also, we should probably do the mirroring for csd and raw too
 
 # what about the path idea by the way?
     # we can do a 2nd pass using the top n% vertices and then go through every window and get the average activations temporally
