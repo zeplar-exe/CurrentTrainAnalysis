@@ -14,6 +14,7 @@ import sys
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from scipy.spatial import KDTree
 import mne
 
 
@@ -125,6 +126,17 @@ def make_2d_traces(df, name, montage_pos):
     return traces
 
 
+def vertex_density(subset_coords, all_coords):
+    if len(subset_coords) < 2:
+        return 0.0
+    all_tree = KDTree(all_coords)
+    mesh_edge = all_tree.query(all_coords, k=2)[0][:, 1].mean()
+    equidistant_nn = mesh_edge * np.sqrt(len(all_coords) / len(subset_coords))
+    sub_tree = KDTree(subset_coords)
+    mean_nn = sub_tree.query(subset_coords, k=2)[0][:, 1].mean()
+    return float(np.clip(1 - mean_nn / equidistant_nn, 0, 1))
+
+
 def add_head_outline(fig):
     theta = np.linspace(0, 2 * np.pi, 100)
     r = 0.095
@@ -150,16 +162,25 @@ if __name__ == "__main__":
 
     fig = go.Figure()
 
+    density_lines = []
+
     if mode == "inverse":
         for path in paths:
             df, _ = load(path)
             name = path.rsplit("/", 1)[-1].replace(".csv", "")
+            all_coords = df[["x", "y", "z"]].values
             for trace in make_3d_traces(df, name):
                 fig.add_trace(trace)
+
+            for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
+                subset = df[df.value >= df.value.quantile(threshold)]
+                d = vertex_density(subset[["x", "y", "z"]].values, all_coords)
+                density_lines.append(f"{name} {pct_label}: {d:.3f}")
+
         fig.update_layout(
             scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
             title="Source-space colony — " + ", ".join(paths),
-            margin=dict(l=0, r=0, t=40, b=0),
+            margin=dict(l=0, r=0, t=80, b=0),
             legend=dict(itemclick="toggle", itemdoubleclick="toggleothers"),
         )
     else:
@@ -169,14 +190,33 @@ if __name__ == "__main__":
             name = path.rsplit("/", 1)[-1].replace(".csv", "")
             for trace in make_2d_traces(df, name, montage_pos):
                 fig.add_trace(trace)
+
+            matched = df.copy()
+            matched["electrode"] = matched["electrode"].str.upper()
+            matched = matched[matched["electrode"].isin(montage_pos)]
+            if not matched.empty:
+                all_coords = np.array([montage_pos[e] for e in matched["electrode"]])
+                for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
+                    subset_mask = matched["value"] >= matched["value"].quantile(threshold)
+                    subset_coords = np.array([montage_pos[e] for e in matched.loc[subset_mask, "electrode"]])
+                    d = vertex_density(subset_coords, all_coords)
+                    density_lines.append(f"{name} {pct_label}: {d:.3f}")
+
         add_head_outline(fig)
         fig.update_layout(
             title=f"Electrode colony ({mode}) — " + ", ".join(paths),
             xaxis=dict(scaleanchor="y", showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            margin=dict(l=0, r=0, t=40, b=0),
+            margin=dict(l=0, r=0, t=80, b=0),
             legend=dict(itemclick="toggle", itemdoubleclick="toggleothers"),
             plot_bgcolor="white",
+        )
+
+    if density_lines:
+        fig.add_annotation(
+            text="Density: " + " | ".join(density_lines),
+            xref="paper", yref="paper", x=0.5, y=1.05,
+            showarrow=False, font=dict(size=11),
         )
 
     output_name = f"colony_viewer_{mode}.html"

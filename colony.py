@@ -9,7 +9,6 @@ from rich.panel import Panel
 
 DATASET_SPECS = {
     "eegmmidb": {
-        "kind": "csv",
         "root": Path("./datasets/eegmmidb"),
         "sfreq": 160.0,
         "subjects": [f"S{i:03d}" for i in range(1, 103 + 1)],
@@ -20,7 +19,6 @@ DATASET_SPECS = {
             "T8", "T9", "T10", "TP7", "TP8", "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
             "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2", "Iz",
         ],
-        "run_glob": "SUB_{subject_id}_SIG_*.csv",
         "event_ids": {
             1: "task1_relax",
             2: "task1_real_left_fist",
@@ -127,7 +125,7 @@ class Colony:
         return (self.colony_neg - np.min(self.colony_neg)) / np.percentile(self.colony_neg, 99)
 
 
-def _read_csv_record(record: Path, spec: dict):
+def _read_eegmmidb_record(record: Path, spec: dict):
     signal_path = Path(record)
     annotation_path = signal_path.with_name(signal_path.name.replace("_SIG_", "_ANN_"))
 
@@ -146,7 +144,7 @@ def _read_csv_record(record: Path, spec: dict):
     onset = (annotation_data[:, 3] - 1) / spec["sfreq"]
     duration = (annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"]
     description = annotation_data[:, 0].astype(int).astype(str)
-    
+
     raw.set_annotations(mne.Annotations(onset=onset, duration=duration, description=description))
     events = np.column_stack(
         [
@@ -160,16 +158,15 @@ def _read_csv_record(record: Path, spec: dict):
 
 def load_subject(dataset, subject):
     spec = get_dataset_spec(dataset)
-    subject_id = subject[1:] if subject.startswith("S") else subject
-    runs = sorted(spec["root"].glob(spec["run_glob"].format(subject_id=subject_id)))
-
-    if not runs:
-        raise ValueError(f"Subject {subject} not found in dataset {dataset}")
 
     if dataset == "eegmmidb":
+        subject_id = subject[1:] if subject.startswith("S") else subject
+        runs = sorted(spec["root"].glob(f"SUB_{subject_id}_SIG_*.csv"))
+        if not runs:
+            raise ValueError(f"Subject {subject} not found in dataset {dataset}")
         return runs[0], runs[2:]
-    else:
-        return runs[0], runs[1:]
+
+    raise ValueError(f"Unsupported dataset: {dataset}")
     
 def fix_raw(dataset, raw):
     raw.notch_filter(freqs=60.0, fir_design='firwin')
@@ -202,13 +199,14 @@ def fix_raw(dataset, raw):
 
 def read_subject_record(dataset, record):
     spec = get_dataset_spec(dataset)
-    if spec["kind"] == "csv":
-        raw, events = _read_csv_record(record, spec)
+
+    if dataset == "eegmmidb":
+        raw, events = _read_eegmmidb_record(record, spec)
     else:
-        raise ValueError(f"Unsupported dataset kind: {spec['kind']}")
+        raise ValueError(f"Unsupported dataset: {dataset}")
 
     fix_raw(dataset, raw)
-    
+
     return raw, events
       
 def build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno):
@@ -235,7 +233,7 @@ def build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno):
     return mirror_map
 
 
-def setup_inverse(dataset, subject, raw_baseline):
+def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False):
     save_file = Path("./inverse") / dataset / subject / "operator.fif"
     save_file.parent.mkdir(parents=True, exist_ok=True)
     
@@ -252,7 +250,7 @@ def setup_inverse(dataset, subject, raw_baseline):
     noise_cov = mne.compute_raw_covariance(
         raw_baseline, 
         method='shrunk'
-    )
+    ) if not ad_hoc_resting else mne.make_ad_hoc_cov(raw_baseline.info)
 
     inverse_operator = make_inverse_operator(
         raw_baseline.info, 
@@ -452,9 +450,8 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 
 # WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
 # also: let's just find the 32, 64, 128 datasets we want to use so we're not limited to MI
-    # refactor _read_csv_record to be eegmbdi-specific (remove the glob in the spec and put it here)
-# for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
-# ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
+    # + refactor _read_csv_record to be eegmbdi-specific (remove the glob in the spec and put it here)
+# + ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
 # how do we choose when to mirror and when not to mirror during colony growth?
 # looks like we have an unsupervised clusterer on our hands: test by collecting colony on some arbitrary event (or relaxation) 
     # and then do a comparison with CSD & Inverse on the arbitrary epoch and the coalesced colony
@@ -463,6 +460,7 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
             # also: do we mirror the input epoch? I guess so; you could test with/without
         # oh, we should do this per-band too, to see if the band has an effect on the accuracy
     # cause: inverse handles spatial densities; CSD handles dipoles and provides another form of localization
+    # for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
 # HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
 # after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
 
