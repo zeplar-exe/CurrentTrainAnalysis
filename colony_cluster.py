@@ -6,6 +6,7 @@ import pandas as pd
 from tqdm import tqdm
 from colony import Colony, build_hemisphere_mirror_map, compute_gain, load_subject, read_subject_record, setup_inverse, BANDS, DATASET_SPECS, TIMESTEP
 import numpy as np
+from collections import defaultdict
 
 reference_colonies = [
     "task1_real_left_fist",
@@ -26,9 +27,24 @@ test_eeg = {
 
 WINDOW_LENGTH = 2000 / 1000
 
+def get_window_event(raw, start_time, end_time, spec):
+    for annotation in raw.annotations:
+        onset = annotation["onset"].item()
+        dur = annotation["duration"].item()
+        ann_end = onset + dur
+        overlap = min(end_time, ann_end) - max(start_time, onset)
+        
+        if overlap > (end_time - start_time) * 0.5:
+            desc = int(annotation["description"].item().strip())
+            return spec["event_ids"].get(desc)
+    
+    return None
+
 for dataset, subjects in test_eeg.items():
     spec = DATASET_SPECS[dataset]
-    subject_stats = {}
+
+    dataset_confusion = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    subject_results = {}
 
     for subject, record_indices in tqdm(subjects.items(), desc="Subjects"):
         subject_baseline_file, subject_active_files = load_subject(dataset, subject)
@@ -49,11 +65,23 @@ for dataset, subjects in test_eeg.items():
         rh_vertno = inv['src'][1]['vertno']
         inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
 
-        distances = {ref: [] for ref in reference_colonies}
+        subject_confusion = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        subject_cosines = []
 
         for band_name, band in tqdm(BANDS.items(), desc=f"{subject} bands", leave=False):
             low = band["low"]
             high = min(band["high"], raw_baseline.info["sfreq"] / 2 - 1)
+
+            ref_cache = {}
+            for source_type in ["vol", "csd", "inverse"]:
+                for ref in reference_colonies:
+                    cluster_path = Path(f"coalesce/{dataset}/{source_type}/{band_name}/{ref}/pos.csv")
+                    
+                    cluster_df = pd.read_csv(cluster_path)
+                    cluster_values = cluster_df["value"].values
+                    cluster_colony = Colony(len(cluster_values), include_pos=True)
+                    cluster_colony.colony_pos = cluster_values
+                    ref_cache[(source_type, ref)] = cluster_colony.pos_weights()
 
             for r_id in record_indices:
                 raw_record, _ = read_subject_record(dataset, subject_active_files[r_id])
@@ -64,6 +92,8 @@ for dataset, subjects in test_eeg.items():
                 for i in tqdm(range(n_windows), desc=f"{band_name} r{r_id}", leave=False):
                     start_time = i * WINDOW_LENGTH
                     end_time = start_time + WINDOW_LENGTH
+
+                    true_event = get_window_event(raw_record, start_time, end_time, spec) or "rest"
                     raw_window = raw_filtered.copy().crop(tmin=start_time, tmax=end_time)
 
                     colonies = compute_gain(prepared_inv, raw_window, inverse_mirror_map, lambda2, TIMESTEP,
@@ -71,62 +101,95 @@ for dataset, subjects in test_eeg.items():
                                             include_pos=True, include_neg=True,
                                             use_epochs=False)
 
-                    for (source, group), colony in colonies.items():
-                        for ref in reference_colonies:
-                            cluster_path = Path(f"coalesce/{dataset}/{source}/{band_name}/{ref}/pos.csv")
-                            if not cluster_path.exists():
-                                continue
-                            cluster_df = pd.read_csv(cluster_path)
-                            cluster_values = cluster_df["value"].values
-                            cluster_colony = Colony(len(cluster_values), include_pos=True, include_neg=False)
-                            cluster_colony.colony_pos = cluster_values
+                    for (source, _), colony in colonies.items():
+                        colony_weights = colony.pos_weights()
 
-                            cluster_weights = cluster_colony.pos_weights()
-                            colony_weights = colony.pos_weights()
-                            
-                            distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
+                        best_ref = None
+                        best_cosine = -1.0
+
+                        for ref in reference_colonies:
+                            cluster_weights = ref_cache[(source, ref)]
                             norm_product = np.linalg.norm(cluster_weights) * np.linalg.norm(colony_weights)
                             cosine_sim = np.dot(cluster_weights, colony_weights) / norm_product if norm_product > 0 else 0.0
-                            distances[ref].append({
+
+                            if cosine_sim > best_cosine:
+                                best_cosine = cosine_sim
+                                best_ref = ref
+
+                        if best_ref is not None:
+                            subject_confusion[source][band_name][(true_event, best_ref)] += 1
+                            dataset_confusion[source][band_name][(true_event, best_ref)] += 1
+                            subject_cosines.append({
                                 "source": source,
                                 "band": band_name,
-                                "record": r_id,
-                                "window": i,
-                                "distance": distance,
-                                "cosine": cosine_sim,
+                                "true": true_event,
+                                "predicted": best_ref,
+                                "correct": true_event == best_ref,
+                                "cosine": best_cosine,
                             })
 
-        subject_stats[subject] = distances
+        subject_results[subject] = subject_cosines
 
         print(f"\n{'='*60}")
         print(f"Subject: {subject}")
         print(f"{'='*60}")
-        for ref, entries in distances.items():
-            if not entries:
-                continue
-            dists = [e["distance"] for e in entries]
-            cosines = [e["cosine"] for e in entries]
-            print(f"  {ref}:")
-            print(f"    dist:   n={len(dists)}  mean={np.mean(dists):.4f}  std={np.std(dists):.4f}  min={np.min(dists):.4f}  max={np.max(dists):.4f}")
-            print(f"    cosine: n={len(cosines)}  mean={np.mean(cosines):.4f}  std={np.std(cosines):.4f}  min={np.min(cosines):.4f}  max={np.max(cosines):.4f}")
+
+        for source in sorted(subject_confusion):
+            print(f"\n  [{source}]")
+            for band_name in sorted(subject_confusion[source]):
+                confusion = subject_confusion[source][band_name]
+                total = sum(confusion.values())
+                correct = sum(v for (t, p), v in confusion.items() if t == p)
+                acc = correct / total if total > 0 else 0
+                print(f"    {band_name}: {correct}/{total} ({acc:.1%})")
+
+                for true_event in sorted({t for t, _ in confusion}):
+                    preds = {p: v for (t, p), v in confusion.items() if t == true_event}
+                    row_total = sum(preds.values())
+                    row_correct = preds.get(true_event, 0)
+                    pred_str = "  ".join(f"{p}={v}" for p, v in sorted(preds.items(), key=lambda x: -x[1]))
+                    marker = "*" if true_event in reference_colonies else " "
+                    print(f"     {marker}{true_event}: {row_correct}/{row_total}  [{pred_str}]")
 
     print(f"\n{'='*60}")
     print(f"Dataset summary: {dataset}")
     print(f"{'='*60}")
-    for ref in reference_colonies:
-        all_dists = []
-        for subject, distances in subject_stats.items():
-            all_dists.extend(e["distance"] for e in distances[ref])
-        if not all_dists:
-            continue
-        print(f"  {ref}:")
-        all_cosines = []
-        for subject, distances in subject_stats.items():
-            all_cosines.extend(e["cosine"] for e in distances[ref])
-        print(f"    dist:   n={len(all_dists)}  mean={np.mean(all_dists):.4f}  std={np.std(all_dists):.4f}  min={np.min(all_dists):.4f}  max={np.max(all_dists):.4f}")
-        print(f"    cosine: n={len(all_cosines)}  mean={np.mean(all_cosines):.4f}  std={np.std(all_cosines):.4f}  min={np.min(all_cosines):.4f}  max={np.max(all_cosines):.4f}")
-        for subject, distances in subject_stats.items():
-            subj_dists = [e["distance"] for e in distances[ref]]
-            subj_cosines = [e["cosine"] for e in distances[ref]]
-            if subj_dists:
-                print(f"      {subject}: dist={np.mean(subj_dists):.4f}±{np.std(subj_dists):.4f}  cosine={np.mean(subj_cosines):.4f}±{np.std(subj_cosines):.4f}")
+
+    for source in sorted(dataset_confusion):
+        print(f"\n  [{source}]")
+        for band_name in sorted(dataset_confusion[source]):
+            confusion = dataset_confusion[source][band_name]
+            total = sum(confusion.values())
+            correct = sum(v for (t, p), v in confusion.items() if t == p)
+            acc = correct / total if total > 0 else 0
+            
+            print(f"    {band_name}: {correct}/{total} ({acc:.1%})")
+
+            for true_event in reference_colonies:
+                row_total = sum(v for (t, p), v in confusion.items() if t == true_event)
+                
+                if row_total == 0:
+                    continue
+                
+                preds = {p: v for (t, p), v in confusion.items() if t == true_event}
+                pred_str = "  ".join(f"{p.split('_', 1)[1][:20]}={v}" for p, v in sorted(preds.items(), key=lambda x: -x[1]))
+                row_correct = preds.get(true_event, 0)
+                
+                print(f"      {true_event}: {row_correct}/{row_total} ({row_correct/row_total:.0%})  [{pred_str}]")
+
+        all_entries = [e for subj in subject_results.values() for e in subj if e["source"] == source]
+        
+        if all_entries:
+            correct_cosines = [e["cosine"] for e in all_entries if e["correct"]]
+            wrong_cosines = [e["cosine"] for e in all_entries if not e["correct"]]
+            if correct_cosines:
+                print(f"    correct match cosine: mean={np.mean(correct_cosines):.4f}  std={np.std(correct_cosines):.4f}")
+            if wrong_cosines:
+                print(f"    wrong match cosine:   mean={np.mean(wrong_cosines):.4f}  std={np.std(wrong_cosines):.4f}")
+
+    print(f"\n  Per-subject accuracy:")
+    for subject, entries in subject_results.items():
+        if entries:
+            correct = sum(1 for e in entries if e["correct"])
+            total = len(entries)
+            print(f"    {subject}: {correct}/{total} ({correct/total:.1%})")

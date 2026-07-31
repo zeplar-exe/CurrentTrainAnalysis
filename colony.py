@@ -147,7 +147,8 @@ def _read_eegmmidb_record(record: Path, spec: dict):
     annotation_data = np.atleast_2d(np.loadtxt(annotation_path, delimiter=",", dtype=float))
     annotation_data = annotation_data[~np.isin(annotation_data[:, 0], spec.get("ignore_events", [])), :]
     onset = (annotation_data[:, 3] - 1) / spec["sfreq"]
-    duration = (annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"]
+    # mne complains about annotation durations
+    duration = np.minimum((annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"], raw.duration - onset)
     description = annotation_data[:, 0].astype(int).astype(str)
 
     raw.set_annotations(mne.Annotations(onset=onset, duration=duration, description=description))
@@ -176,7 +177,7 @@ def load_subject(dataset, subject):
 def fix_raw(dataset, raw):
     raw.notch_filter(freqs=60.0, fir_design='firwin')
     
-    ica = mne.preprocessing.ICA(n_components=0.995, method='fastica')
+    ica = mne.preprocessing.ICA(n_components=0.995, method='fastica', max_iter=500)
     ica.fit(raw.copy().filter(1, min(100, raw.info["sfreq"] / 2 - 1), fir_design='firwin'))
     muscle_idx, scores = ica.find_bads_muscle(raw)
     ica.exclude = muscle_idx
