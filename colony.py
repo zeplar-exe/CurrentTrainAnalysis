@@ -3,12 +3,16 @@ import mne
 from mne.minimum_norm import InverseOperator
 import numpy as np
 from numpy.typing import NDArray
+import warnings
 import scipy
 from scipy.spatial import KDTree
 from pathlib import Path
 from rich.live import Live
 from rich.panel import Panel
 from typing import Literal
+
+warnings.filterwarnings("ignore", message="FastICA did not converge")
+warnings.filterwarnings("ignore", message=".*does not conform to MNE naming conventions.*")
 
 Source = Literal["vol", "csd", "inverse"]
 ColonyMap = dict[tuple[Source, str], "Colony"]
@@ -177,7 +181,7 @@ def load_subject(dataset, subject):
 def fix_raw(dataset, raw):
     raw.notch_filter(freqs=60.0, fir_design='firwin')
     
-    ica = mne.preprocessing.ICA(n_components=0.995, method='fastica', max_iter=500)
+    ica = mne.preprocessing.ICA(n_components=0.995, method='fastica')
     ica.fit(raw.copy().filter(1, min(100, raw.info["sfreq"] / 2 - 1), fir_design='firwin'))
     muscle_idx, scores = ica.find_bads_muscle(raw)
     ica.exclude = muscle_idx
