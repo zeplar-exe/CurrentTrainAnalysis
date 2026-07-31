@@ -1,4 +1,4 @@
-from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, write_inverse_operator, read_inverse_operator, make_inverse_operator
+from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, apply_inverse_epochs, write_inverse_operator, read_inverse_operator, make_inverse_operator
 import mne
 import numpy as np
 import scipy
@@ -290,123 +290,107 @@ if __name__ == "__main__":
                 src_data = mne.read_source_spaces(src)
                         
                 colonies = {}
-                
-                lh_vertno = 0
-                rh_vertno = 0
-                inverse_mirror_map = None
-                
+
+                lh_vertno = inv['src'][0]['vertno']
+                rh_vertno = inv['src'][1]['vertno']
+                n_vertices = len(lh_vertno) + len(rh_vertno)
+                inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
+
                 include_raw = False
                 include_abs = False
                 include_pos = True
                 include_neg = True
 
+                reverse_event_ids = {v: k for k, v in DATASET_SPECS[dataset]["event_ids"].items()
+                                     if k not in spec.get("ignore_events", [])}
+
                 target_records = subject_active_files[:20]
                 for record_index, record in enumerate(target_records):
                     raw_active, events_active = read_subject_record(dataset, record)
-                    
+
                     grouped_annotations = {}
-                    
-                    #annotations_active = mne.annotations_from_events(
-                    #    events=events_active, 
-                    #    sfreq=raw_active.info['sfreq']
-                    #)
                     annotations_active = raw_active.annotations
 
                     for annotation in annotations_active:
                         desc = int(annotation["description"].item().strip())
                         key = DATASET_SPECS[dataset]["event_ids"][desc]
-                        
+
                         if key not in grouped_annotations:
                             grouped_annotations[key] = []
                         grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
 
                     print(f"Grouped Annotations: {grouped_annotations}")
-                    
-                    updated_text = f"""Applying inverse solution...
-Dataset: {dataset} ({dataset_index + 1}/{len(target_datasets)})
-Record: {record_index + 1}/{len(target_records)}
-Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
-                    live.update(Panel(updated_text, title="Colony Processing", expand=False))
-                    
-                    banded_raws = {}
-                    banded_stc = {}
-                    
+
+                    sfreq = raw_active.info["sfreq"]
+
                     band_index = 0
                     for band_name, band in BANDS.items():
                         band_index += 1
                         low = band["low"]
-                        high = min(band["high"], raw_active.info["sfreq"] / 2.0 - 1)
-                        
-                        updated_text = f"""Filtering data ({low} Hz - {high} Hz)
+                        high = min(band["high"], sfreq / 2.0 - 1)
+
+                        updated_text = f"""Filtering + processing ({low} Hz - {high} Hz)
 Band: {band_name} ({band_index}/{len(BANDS)})
 Dataset: {dataset} ({dataset_index + 1}/{len(target_datasets)})
 Record: {record_index + 1}/{len(target_records)}
 Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
                         live.update(Panel(updated_text, title="Colony Processing", expand=False))
-                        
-                        raw_data = raw_active.copy()
-                        raw_data.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
-                        banded_raws[band_name] = raw_data
 
-                        stc = apply_inverse_raw(
-                            raw_data, 
-                            prepared_inv, 
-                            lambda2=1.0 / (snr ** 2),
-                            buffer_size=5000,
-                            method="dSPM",
-                            prepared=True
-                        )
-                        
-                        banded_stc[band_name] = stc
-                    
-                    sfreq = raw_active.info["sfreq"]
+                        raw_filtered = raw_active.copy()
+                        raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
 
-                    band_index = 0
-                    for band_name, band in BANDS.items():
-                        band_index += 1     
-                            
-                        stc = banded_stc[band_name]
-                        lh_vertno = stc.lh_vertno
-                        rh_vertno = stc.rh_vertno
+                        csd_data = mne.preprocessing.compute_current_source_density(raw_filtered.copy()).get_data()
+                        vol_data = raw_filtered.get_data()
 
-                        if inverse_mirror_map is None:
-                            inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
-
-                        low = band["low"]
-                        high = min(band["high"], sfreq / 2.0 - 1)
-                    
-                        raw_data = banded_raws[band_name]
-                        
-                        vertex_data = stc.data
-                        csd_data = mne.preprocessing.compute_current_source_density(raw_data.copy()).get_data()
-                        raw_data = banded_raws[band_name].get_data()
-                        
-                        for (source, data) in {"vol": raw_data, "csd": csd_data, "inverse": vertex_data}.items():
+                        for source, data in [("vol", vol_data), ("csd", csd_data)]:
                             for group, annotations in grouped_annotations.items():
-                                updated_text = f"""Processing colony for group: {band_name}
-Band: {band_name} ({band_index}/{len(BANDS)})
-Dataset: {dataset} ({dataset_index + 1}/{len(target_datasets)})
-Record: {record_index + 1}/{len(target_records)}
-Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
-                                live.update(Panel(updated_text, title="Colony Processing", expand=False))
-                                
-                                if group not in colonies:
+                                if (source, band_name, group) not in colonies:
                                     colonies[(source, band_name, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                                
                                 colony = colonies[(source, band_name, group)]
                                 
-                                for annotation in annotations:
-                                    start_sample = int(annotation[0] * sfreq)
-                                    end_sample = int(annotation[1] * sfreq)
-                                    sample = data[:, start_sample:end_sample]
+                                for start_time, end_time in annotations:
+                                    sample = data[:, int(start_time * sfreq):int(end_time * sfreq)]
                                     
-                                    if len(sample) < TIMESTEP * sfreq:
+                                    if sample.shape[1] < TIMESTEP * sfreq:
                                         continue
                                     
                                     colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
 
-                                    if source == "inverse":
-                                        mirrored = sample[inverse_mirror_map, :]
-                                        colony.feed(mirrored, step=int(TIMESTEP * sfreq), sfreq=sfreq)
+                        event_id = {g: reverse_event_ids[g] for g in grouped_annotations}
+                        max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
+
+                        ann_durations = {}
+                        for group, anns in grouped_annotations.items():
+                            for st, et in anns:
+                                ann_durations[(reverse_event_ids[group], int(st * sfreq))] = et - st
+
+                        epochs = mne.Epochs(raw_filtered, events_active, event_id=event_id,
+                                            tmin=0, tmax=max_dur, baseline=None, preload=True, verbose=False)
+                        stc_gen = apply_inverse_epochs(epochs, prepared_inv,
+                                                       lambda2=1.0 / (snr ** 2),
+                                                       method="dSPM", prepared=True,
+                                                       return_generator=True)
+
+                        for stc, event_row in zip(stc_gen, epochs.events):
+                            event_code = event_row[2]
+                            onset_sample = event_row[0]
+                            group = DATASET_SPECS[dataset]["event_ids"][event_code]
+
+                            actual_dur = ann_durations.get((event_code, onset_sample), max_dur)
+                            actual_samples = min(int(actual_dur * sfreq), stc.data.shape[1])
+                            sample = stc.data[:, :actual_samples]
+
+                            if sample.shape[1] < TIMESTEP * sfreq:
+                                continue
+
+                            if ("inverse", band_name, group) not in colonies:
+                                colonies[("inverse", band_name, group)] = Colony(n_vertices, include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                            
+                            colony = colonies[("inverse", band_name, group)]
+
+                            colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
+                            colony.feed(sample[inverse_mirror_map, :], step=int(TIMESTEP * sfreq), sfreq=sfreq)
 
                 lh_coordinates = src_data[0]['rr'][lh_vertno]
                 rh_coordinates = src_data[1]['rr'][rh_vertno]
