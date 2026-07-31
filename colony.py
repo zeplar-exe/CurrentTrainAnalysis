@@ -46,7 +46,7 @@ DATASET_SPECS = {
         "ignore_events": [1, 4, 7, 10]
     },
     "grasplift": {
-        "root": Path("./datasets/grasp-lift/train"),
+        "root": Path("./datasets/grasplift/train"),
         "sfreq": 500.0,
         "subjects": [f"subj{i}" for i in range(1, 13)],
         "channels": [
@@ -434,7 +434,7 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
 
 if __name__ == "__main__":
     with Live(Panel("Initializing...", expand=False), auto_refresh=True) as live:
-        target_datasets = ["eegmmidb"]
+        target_datasets = ["grasplift"]
         for dataset_index, dataset in enumerate(target_datasets):
             spec = get_dataset_spec(dataset)
             target_subjects = spec["subjects"][:10]
@@ -445,7 +445,7 @@ if __name__ == "__main__":
                 output_dir = Path("./colonies") / dataset / subject
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
-                inv, src, bem = setup_inverse(dataset, subject, raw_baseline)
+                inv, src, bem = setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=dataset=="grasplift")
                 snr = 3.0
                 lambda2 = 1.0 / (snr ** 2)
                 prepared_inv = prepare_inverse_operator(

@@ -12,15 +12,21 @@ from collections import defaultdict
 INTERACTIVE = sys.stderr.isatty()
 
 reference_colonies = {
-    "eegmmidb": [
-        "task1_real_left_fist",
-        "task1_real_right_fist",
-        "task2_imagine_left_fist",
-        "task2_imagine_right_fist",
-        "task3_real_both_feet",
-        "task3_real_both_fists",
-        "task4_imagine_both_feet",
-        "task4_imagine_both_fists"
+    #"eegmmidb": [
+    #    "task1_real_left_fist",
+    #    "task1_real_right_fist",
+    #    "task2_imagine_left_fist",
+    #    "task2_imagine_right_fist",
+    #    "task3_real_both_feet",
+    #    "task3_real_both_fists",
+    #    "task4_imagine_both_feet",
+    #    "task4_imagine_both_fists"
+    #],
+    "grasplift": [
+        "grasp_HandStart",
+        "grasp_FirstDigitTouch",
+        "grasp_LiftOff",
+        "grasp_Replace",
     ]
 }
 
@@ -34,7 +40,7 @@ test_eeg = {
     }
 }
 
-WINDOW_LENGTH = 2000 / 1000
+WINDOW_LENGTH = 1000 / 1000
 
 def get_window_event(raw, start_time, end_time, spec):
     for annotation in raw.annotations:
