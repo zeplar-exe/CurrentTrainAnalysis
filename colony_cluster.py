@@ -82,12 +82,15 @@ for dataset, subjects in test_eeg.items():
                             colony_weights = colony.pos_weights()
                             
                             distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
+                            norm_product = np.linalg.norm(cluster_weights) * np.linalg.norm(colony_weights)
+                            cosine_sim = np.dot(cluster_weights, colony_weights) / norm_product if norm_product > 0 else 0.0
                             distances[ref].append({
                                 "source": source,
                                 "band": band_name,
                                 "record": r_id,
                                 "window": i,
                                 "distance": distance,
+                                "cosine": cosine_sim,
                             })
 
         subject_stats[subject] = distances
@@ -99,8 +102,10 @@ for dataset, subjects in test_eeg.items():
             if not entries:
                 continue
             dists = [e["distance"] for e in entries]
+            cosines = [e["cosine"] for e in entries]
             print(f"  {ref}:")
-            print(f"    n={len(dists)}  mean={np.mean(dists):.4f}  std={np.std(dists):.4f}  min={np.min(dists):.4f}  max={np.max(dists):.4f}")
+            print(f"    dist:   n={len(dists)}  mean={np.mean(dists):.4f}  std={np.std(dists):.4f}  min={np.min(dists):.4f}  max={np.max(dists):.4f}")
+            print(f"    cosine: n={len(cosines)}  mean={np.mean(cosines):.4f}  std={np.std(cosines):.4f}  min={np.min(cosines):.4f}  max={np.max(cosines):.4f}")
 
     print(f"\n{'='*60}")
     print(f"Dataset summary: {dataset}")
@@ -112,8 +117,13 @@ for dataset, subjects in test_eeg.items():
         if not all_dists:
             continue
         print(f"  {ref}:")
-        print(f"    n={len(all_dists)}  mean={np.mean(all_dists):.4f}  std={np.std(all_dists):.4f}  min={np.min(all_dists):.4f}  max={np.max(all_dists):.4f}")
+        all_cosines = []
+        for subject, distances in subject_stats.items():
+            all_cosines.extend(e["cosine"] for e in distances[ref])
+        print(f"    dist:   n={len(all_dists)}  mean={np.mean(all_dists):.4f}  std={np.std(all_dists):.4f}  min={np.min(all_dists):.4f}  max={np.max(all_dists):.4f}")
+        print(f"    cosine: n={len(all_cosines)}  mean={np.mean(all_cosines):.4f}  std={np.std(all_cosines):.4f}  min={np.min(all_cosines):.4f}  max={np.max(all_cosines):.4f}")
         for subject, distances in subject_stats.items():
             subj_dists = [e["distance"] for e in distances[ref]]
+            subj_cosines = [e["cosine"] for e in distances[ref]]
             if subj_dists:
-                print(f"      {subject}: mean={np.mean(subj_dists):.4f}  std={np.std(subj_dists):.4f}")
+                print(f"      {subject}: dist={np.mean(subj_dists):.4f}±{np.std(subj_dists):.4f}  cosine={np.mean(subj_cosines):.4f}±{np.std(subj_cosines):.4f}")
