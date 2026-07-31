@@ -19,7 +19,7 @@ reference_colonies = {
         "task2_imagine_right_fist",
         "task3_real_both_feet",
         "task3_real_both_fists",
-        "task4_imagine_both_feet"
+        "task4_imagine_both_feet",
         "task4_imagine_both_fists"
     ]
 }
@@ -93,8 +93,10 @@ for dataset, subjects in test_eeg.items():
                         cluster_values = cluster_df["value"].values
                         cluster_colony = Colony(len(cluster_values), include_pos=True)
                         cluster_colony.colony_pos = cluster_values
+                        
                         weights = cluster_colony.pos_weights()
                         threshold = np.quantile(weights, 0.75)
+                        
                         ref_cache[(source_type, ref)] = (weights, set(np.where(weights >= threshold)[0]))
 
             for r_id in record_indices:
@@ -122,32 +124,48 @@ for dataset, subjects in test_eeg.items():
                         colony_threshold = np.quantile(colony_weights, 0.75)
                         colony_top = set(np.where(colony_weights >= colony_threshold)[0])
 
-                        best_ref = None
-                        best_overlap = -1.0
-                        best_distance = np.inf
+                        all_refs = [ref for _, refs in reference_colonies.items() for ref in refs]
+                        votes = defaultdict(int)
+                        pair_details = {}
 
-                        for ref_dataset, refs in reference_colonies.items():
-                            for ref in refs:
-                                cluster_weights, ref_top = ref_cache[(source, ref)]
+                        for ai, ref_a in enumerate(all_refs):
+                            for ref_b in all_refs[ai + 1:]:
+                                if (source, ref_a) not in ref_cache or (source, ref_b) not in ref_cache:
+                                    continue
+                                _, top_a = ref_cache[(source, ref_a)]
+                                _, top_b = ref_cache[(source, ref_b)]
 
-                                overlap = len(ref_top & colony_top) / len(ref_top | colony_top) if ref_top | colony_top else 0.0
-                                distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
+                                shared = top_a & top_b
+                                disc_a = top_a - shared
+                                disc_b = top_b - shared
 
-                                if overlap > best_overlap or (overlap == best_overlap and distance < best_distance):
-                                    best_overlap = overlap
-                                    best_distance = distance
-                                    best_ref = ref
+                                hits_a = len(disc_a & colony_top)
+                                hits_b = len(disc_b & colony_top)
 
-                        if best_ref is not None:
-                            subject_confusion[source][band_name][(true_event, best_ref)] += 1
-                            dataset_confusion[source][band_name][(true_event, best_ref)] += 1
-                            subject_entries.append({
-                                "source": source,
-                                "band": band_name,
-                                "true": true_event,
-                                "predicted": best_ref,
-                                "correct": true_event == best_ref,
-                                "overlap": best_overlap,
+                                if hits_a > hits_b:
+                                    votes[ref_a] += 1
+                                elif hits_b > hits_a:
+                                    votes[ref_b] += 1
+
+                        if not votes:
+                            continue
+
+                        best_ref = max(votes, key=lambda k: votes[k])
+                        best_votes = votes[best_ref]
+                        cluster_weights, ref_top = ref_cache[(source, best_ref)]
+                        best_overlap = len(ref_top & colony_top) / len(ref_top | colony_top) if ref_top | colony_top else 0.0
+                        best_distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
+
+                        subject_confusion[source][band_name][(true_event, best_ref)] += 1
+                        dataset_confusion[source][band_name][(true_event, best_ref)] += 1
+                        subject_entries.append({
+                            "source": source,
+                            "band": band_name,
+                            "true": true_event,
+                            "predicted": best_ref,
+                            "correct": true_event == best_ref,
+                            "votes": best_votes,
+                            "overlap": best_overlap,
                                 "distance": best_distance,
                             })
 
@@ -202,7 +220,8 @@ for dataset, subjects in test_eeg.items():
             for label, filt in [("correct", True), ("wrong", False)]:
                 subset = [e for e in all_entries if e["correct"] == filt]
                 if subset:
-                    print(f"    {label}: overlap={np.mean([e['overlap'] for e in subset]):.4f}±{np.std([e['overlap'] for e in subset]):.4f}"
+                    print(f"    {label}: votes={np.mean([e['votes'] for e in subset]):.2f}±{np.std([e['votes'] for e in subset]):.2f}"
+                          f"  overlap={np.mean([e['overlap'] for e in subset]):.4f}±{np.std([e['overlap'] for e in subset]):.4f}"
                           f"  dist={np.mean([e['distance'] for e in subset]):.4f}±{np.std([e['distance'] for e in subset]):.4f}")
 
     print(f"\n  Per-subject accuracy:")
