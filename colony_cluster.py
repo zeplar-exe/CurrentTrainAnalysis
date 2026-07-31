@@ -11,20 +11,26 @@ from collections import defaultdict
 
 INTERACTIVE = sys.stderr.isatty()
 
-reference_colonies = [
-    "task1_real_left_fist",
-    "task2_imagine_left_fist",
-    "task3_real_both_fists",
-    "task4_imagine_both_fists"
-]
+reference_colonies = {
+    "eegmmidb": [
+        "task1_real_left_fist",
+        "task1_real_right_fist",
+        "task2_imagine_left_fist",
+        "task2_imagine_right_fist",
+        "task3_real_both_feet",
+        "task3_real_both_fists",
+        "task4_imagine_both_feet"
+        "task4_imagine_both_fists"
+    ]
+}
 
 test_eeg = {
     "eegmmidb": {
-        "S001": [0, 1, 2, 3, 4, 5],
-        "S002": [0, 1, 2, 3, 4, 5],
-        "S003": [0, 1, 2, 3, 4, 5],
-        "S004": [0, 1, 2, 3, 4, 5],
-        "S005": [0, 1, 2, 3, 4, 5],
+        "S011": [0, 1, 2, 3, 4, 5],
+        "S012": [0, 1, 2, 3, 4, 5],
+        "S013": [0, 1, 2, 3, 4, 5],
+        "S014": [0, 1, 2, 3, 4, 5],
+        "S015": [0, 1, 2, 3, 4, 5],
     }
 }
 
@@ -79,16 +85,17 @@ for dataset, subjects in test_eeg.items():
 
             ref_cache = {}
             for source_type in ["vol", "csd", "inverse"]:
-                for ref in reference_colonies:
-                    cluster_path = Path(f"coalesce/{dataset}/{source_type}/{band_name}/{ref}/pos.csv")
-                    
-                    cluster_df = pd.read_csv(cluster_path)
-                    cluster_values = cluster_df["value"].values
-                    cluster_colony = Colony(len(cluster_values), include_pos=True)
-                    cluster_colony.colony_pos = cluster_values
-                    weights = cluster_colony.pos_weights()
-                    threshold = np.quantile(weights, 0.75)
-                    ref_cache[(source_type, ref)] = (weights, set(np.where(weights >= threshold)[0]))
+                for ref_dataset, refs in reference_colonies.items():
+                    for ref in refs:
+                        cluster_path = Path(f"coalesce/{ref_dataset}/{source_type}/{band_name}/{ref}/pos.csv")
+                        
+                        cluster_df = pd.read_csv(cluster_path)
+                        cluster_values = cluster_df["value"].values
+                        cluster_colony = Colony(len(cluster_values), include_pos=True)
+                        cluster_colony.colony_pos = cluster_values
+                        weights = cluster_colony.pos_weights()
+                        threshold = np.quantile(weights, 0.75)
+                        ref_cache[(source_type, ref)] = (weights, set(np.where(weights >= threshold)[0]))
 
             for r_id in record_indices:
                 print(f"    Record: {r_id}")
@@ -108,7 +115,7 @@ for dataset, subjects in test_eeg.items():
                     colonies = compute_gain(prepared_inv, raw_window, inverse_mirror_map, lambda2, TIMESTEP,
                                             include_vol=True, include_csd=True, include_inverse=True,
                                             include_pos=True, include_neg=True,
-                                            use_epochs=False)
+                                            use_epochs=False, mirror=True)
 
                     for (source, _), colony in colonies.items():
                         colony_weights = colony.pos_weights()
@@ -119,16 +126,17 @@ for dataset, subjects in test_eeg.items():
                         best_overlap = -1.0
                         best_distance = np.inf
 
-                        for ref in reference_colonies:
-                            cluster_weights, ref_top = ref_cache[(source, ref)]
+                        for ref_dataset, refs in reference_colonies.items():
+                            for ref in refs:
+                                cluster_weights, ref_top = ref_cache[(source, ref)]
 
-                            overlap = len(ref_top & colony_top) / len(ref_top | colony_top) if ref_top | colony_top else 0.0
-                            distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
+                                overlap = len(ref_top & colony_top) / len(ref_top | colony_top) if ref_top | colony_top else 0.0
+                                distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
 
-                            if overlap > best_overlap or (overlap == best_overlap and distance < best_distance):
-                                best_overlap = overlap
-                                best_distance = distance
-                                best_ref = ref
+                                if overlap > best_overlap or (overlap == best_overlap and distance < best_distance):
+                                    best_overlap = overlap
+                                    best_distance = distance
+                                    best_ref = ref
 
                         if best_ref is not None:
                             subject_confusion[source][band_name][(true_event, best_ref)] += 1

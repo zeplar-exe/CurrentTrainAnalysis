@@ -276,7 +276,7 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
                  include_vol: bool = False, include_csd: bool = False, include_inverse: bool = False,
                  include_raw: bool = False, include_abs: bool = False,
                  include_pos: bool = False, include_neg: bool = False,
-                 use_epochs: bool = True) -> ColonyMap:
+                 use_epochs: bool = True, mirror=True) -> ColonyMap:
     colonies: ColonyMap = {}
     sfreq = raw.info["sfreq"]
 
@@ -358,7 +358,8 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
             colony = colonies[("inverse", group)]
 
             colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
-            colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
+            if mirror:
+                colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
     else:
         stc = apply_inverse_raw(raw, prepared_inv, lambda2=lambda2,
             method="dSPM", prepared=True)
