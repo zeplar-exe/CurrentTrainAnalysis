@@ -69,7 +69,6 @@ BANDS = {
         "high": 100,
     },
 }
-BANDS = {"standard": BANDS["standard"]}
 
 
 def get_dataset_spec(dataset: str):
