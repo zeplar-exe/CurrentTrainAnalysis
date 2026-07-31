@@ -103,25 +103,28 @@ for dataset, subjects in test_eeg.items():
             raw_record, _ = read_subject_record(dataset, subject_active_files[r_id])
             n_windows = int(raw_record.duration // WINDOW_LENGTH)
             
+            filtered_records = {}
+            for band_name, band in BANDS.items():
+                print(f"    Filtering band: {band_name}")
+                low = band["low"]
+                high = min(band["high"], raw_baseline.info["sfreq"] / 2 - 1)
+                filtered = raw_record.copy()
+                filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
+                filtered_records[band_name] = filtered
+
             for i in tqdm(range(n_windows), desc=f"{r_id}", leave=False, disable=not INTERACTIVE):
                 print(f"        Window: {i+1}/{n_windows}")
                 start_time = i * WINDOW_LENGTH
                 end_time = start_time + WINDOW_LENGTH
-            
+
                 band_data = defaultdict(dict)
 
                 true_event = get_window_event(raw_record, start_time, end_time, spec) or "rest"
-                raw_window = raw_record.copy().crop(tmin=start_time, tmax=end_time)
 
-                for band_name, band in tqdm(BANDS.items(), desc=f"{subject} bands", leave=False, disable=not INTERACTIVE):
-                    print(f"          Band: {band_name}")
-                    low = band["low"]
-                    high = min(band["high"], raw_baseline.info["sfreq"] / 2 - 1)
-                    
-                    raw_filtered = raw_window.copy()
-                    raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
+                for band_name in BANDS:
+                    raw_window = filtered_records[band_name].copy().crop(tmin=start_time, tmax=end_time)
 
-                    colonies = compute_gain(prepared_inv, raw_filtered, inverse_mirror_map, lambda2, TIMESTEP,
+                    colonies = compute_gain(prepared_inv, raw_window, inverse_mirror_map, lambda2, TIMESTEP,
                                             include_vol=True, include_csd=True, include_inverse=True,
                                             include_pos=True, include_neg=True,
                                             use_epochs=False, mirror=True)
