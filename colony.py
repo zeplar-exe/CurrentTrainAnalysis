@@ -45,6 +45,28 @@ DATASET_SPECS = {
         },
         "ignore_events": [1, 4, 7, 10]
     },
+    "grasplift": {
+        "root": Path("./datasets/grasp-lift/train"),
+        "sfreq": 500.0,
+        "subjects": [f"subj{i}" for i in range(1, 13)],
+        "channels": [
+            "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
+            "FC5", "FC1", "FC2", "FC6",
+            "T7", "C3", "Cz", "C4", "T8",
+            "TP9", "CP5", "CP1", "CP2", "CP6", "TP10",
+            "P7", "P3", "Pz", "P4", "P8",
+            "PO9", "O1", "Oz", "O2", "PO10",
+        ],
+        "event_ids": {
+            1: "HandStart",
+            2: "FirstDigitTouch",
+            3: "BothStartLoadPhase",
+            4: "LiftOff",
+            5: "Replace",
+            6: "BothReleased",
+        },
+        "ignore_events": [3, 6],
+    },
 }
 
 TIMESTEP = 50 / 1000 # s
@@ -101,10 +123,11 @@ class Colony:
         self.colony_pos = np.zeros(size)
         self.colony_neg = np.zeros(size)
         
-    def feed(self, data: np.ndarray, step: int, sfreq: int):
-        a = np.abs(scipy.signal.hilbert(data))
-        b = scipy.ndimage.uniform_filter1d(a, size=int(Colony.DEVIATION_RESOLUTION * sfreq), axis=1)
-        data = (a-b)/b
+    def feed(self, data: np.ndarray, step: int, sfreq: int, deviation=True):
+        if deviation:
+            a = np.abs(scipy.signal.hilbert(data))
+            b = scipy.ndimage.uniform_filter1d(a, size=int(Colony.DEVIATION_RESOLUTION * sfreq), axis=1)
+            data = (a-b)/b
             
         last_matrix = np.nan_to_num(data[:, 0:step].mean(axis=1), nan=0.0)
         for i in np.arange(1, np.floor(data.shape[1] / step)):
@@ -166,6 +189,48 @@ def _read_eegmmidb_record(record: Path, spec: dict):
 
     return raw, events
 
+def _read_grasplift_record(record: Path, spec: dict):
+    signal_path = Path(record)
+    events_path = signal_path.with_name(signal_path.name.replace("_data.csv", "_events.csv"))
+
+    n_ch = len(spec["channels"])
+    signal = np.loadtxt(signal_path, delimiter=",", skiprows=1, usecols=range(1, n_ch + 1), dtype=float)
+
+    raw = mne.io.RawArray(signal.T * 1e-6, mne.create_info(spec["channels"], spec["sfreq"], ch_types="eeg"), verbose="error")
+    raw.set_montage("standard_1005")
+    raw.set_eeg_reference(projection=True)
+
+    event_names = list(spec["event_ids"].values())
+    name_to_code = {v: k for k, v in spec["event_ids"].items()}
+    events_data = np.loadtxt(events_path, delimiter=",", skiprows=1, usecols=range(1, len(event_names) + 1), dtype=int)
+
+    onsets = []
+    durations = []
+    descriptions = []
+    event_rows = []
+
+    for col_idx, event_name in enumerate(event_names):
+        col = events_data[:, col_idx]
+        diff = np.diff(col, prepend=0)
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        if len(ends) < len(starts):
+            ends = np.append(ends, len(col))
+
+        code = name_to_code[event_name]
+        for s, e in zip(starts, ends):
+            onset_time = s / spec["sfreq"]
+            dur = min((e - s) / spec["sfreq"], raw.duration - onset_time)
+            onsets.append(onset_time)
+            durations.append(dur)
+            descriptions.append(str(code))
+            event_rows.append([s, 0, code])
+
+    raw.set_annotations(mne.Annotations(onset=onsets, duration=durations, description=descriptions))
+    events = np.array(event_rows) if event_rows else np.empty((0, 3), dtype=int)
+
+    return raw, events
+
 def load_subject(dataset, subject):
     spec = get_dataset_spec(dataset)
 
@@ -175,6 +240,13 @@ def load_subject(dataset, subject):
         if not runs:
             raise ValueError(f"Subject {subject} not found in dataset {dataset}")
         return runs[0], runs[2:]
+
+    if dataset == "grasplift":
+        series = sorted(spec["root"].glob(f"{subject}_series*_data.csv"),
+                        key=lambda p: int(p.stem.split("_series")[1].split("_")[0]))
+        if not series:
+            raise ValueError(f"Subject {subject} not found in dataset {dataset}")
+        return series[0], series[1:]
 
     raise ValueError(f"Unsupported dataset: {dataset}")
     
@@ -186,21 +258,6 @@ def fix_raw(dataset, raw):
     muscle_idx, scores = ica.find_bads_muscle(raw)
     ica.exclude = muscle_idx
     raw = ica.apply(raw.copy())
-    
-    if dataset == "physionet":
-        case_fixing_map = {
-            'Fc5': 'FC5', 'Fc3': 'FC3', 'Fc1': 'FC1', 'Fcz': 'FCz', 'Fc2': 'FC2', 'Fc4': 'FC4', 'Fc6': 'FC6',
-            'Cp5': 'CP5', 'Cp3': 'CP3', 'Cp1': 'CP1', 'Cpz': 'CPz', 'Cp2': 'CP2', 'Cp4': 'CP4', 'Cp6': 'CP6',
-            'Af7': 'AF7', 'Af3': 'AF3', 'Afz': 'AFz', 'Af4': 'AF4', 'Af8': 'AF8',
-            'Ft7': 'FT7', 'Ft8': 'FT8', 'Tp7': 'TP7', 'Tp8': 'TP8',
-            'Po7': 'PO7', 'Po3': 'PO3', 'Poz': 'POz', 'Po4': 'PO4', 'Po8': 'PO8'
-        }
-
-        mapping = {name: name.rstrip('.') for name in raw.ch_names}
-        raw.rename_channels(mapping)
-        raw.rename_channels(case_fixing_map)
-        raw.set_montage('standard_1005')
-        raw.set_eeg_reference(projection=True)
         
     return raw
 
@@ -209,6 +266,8 @@ def read_subject_record(dataset, record):
 
     if dataset == "eegmmidb":
         raw, events = _read_eegmmidb_record(record, spec)
+    elif dataset == "grasplift":
+        raw, events = _read_grasplift_record(record, spec)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
@@ -499,6 +558,8 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # we can do a multi-class probability decoder with this via combination of multiple binary classifiers, one per event
 
 # WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
+    # https://www.nature.com/articles/s41598-022-15252-0
+    # https://link.springer.com/article/10.1186/s13634-015-0251-9#Sec3
 # also: let's just find the 32, 64, 128 datasets we want to use so we're not limited to MI
     # + refactor _read_csv_record to be eegmmidb-specific (remove the glob in the spec and put it here)
 # + ADD: we need to have a check for a null raw baseline and use the... default noise covariance?

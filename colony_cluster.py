@@ -157,8 +157,8 @@ for dataset, subjects in test_eeg.items():
                             neg_union = neg_top | ref_neg_top
                             overlaps[ref]["pos"][band_name] = len(pos_top & ref_pos_top) / len(pos_union) if pos_union else 0.0
                             overlaps[ref]["neg"][band_name] = len(neg_top & ref_neg_top) / len(neg_union) if neg_union else 0.0
-                            distance[ref]["pos"][band_name] = np.sqrt(np.sum(pos_weights * (pos_weights - ref_pos_weights) ** 2))
-                            distance[ref]["neg"][band_name] = np.sqrt(np.sum(neg_weights * (neg_weights - ref_neg_weights) ** 2))
+                            distance[ref]["pos"][band_name] = np.sqrt(np.sum(pos_weights * abs((pos_weights - ref_pos_weights)) ** 2))
+                            distance[ref]["neg"][band_name] = np.sqrt(np.sum(neg_weights * abs((neg_weights - ref_neg_weights)) ** 2))
 
                     return overlaps, distance
                 
@@ -252,3 +252,18 @@ for dataset, subjects in test_eeg.items():
             c = sum(1 for e in entries if e["correct"])
             t = len(entries)
             print(f"    {subject}: {c}/{t} ({c/t:.1%})")
+
+
+
+
+# I don't even fucking know at this point; we just gotta go for maximum power
+    # maybe the scoring needs to take all bands + CSD into account (voltage is useless, drop it)
+    # also implement the negatives as well
+    # also need to start exporting the things that are failing so we have an idea of what's failing and why
+        # maybe have a 3D plot of what is failing based on the intersect/union
+# MAKE A SCRIPT TO GET BETWEEN-BAND AND ACROSS-BAND OVERLAP AVERAGES AND STUFF instead of just guessing
+
+# also, your fucking discriminator makes no fucking sense what are you even doing?
+    # it is 3:10am so I don't have the mental capacity to fucking dig into your asshole but just you fucking wait
+    
+    
