@@ -272,19 +272,17 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
                  include_raw: bool = False, include_abs: bool = False,
                  include_pos: bool = False, include_neg: bool = False,
                  use_epochs: bool = True) -> ColonyMap:
-    colonies = {}
+    colonies: ColonyMap = {}
     sfreq = raw.info["sfreq"]
 
-    grouped_annotations = {}
-    
+    grouped_annotations: dict[str, list[tuple[float, float]]] = {}
+
     if use_epochs:
         for annotation in raw.annotations:
             group = annotation["description"].item().strip()
             if group not in grouped_annotations:
                 grouped_annotations[group] = []
             grouped_annotations[group].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
-    else:
-        grouped_annotations[""] = [(0, raw.duration)]
 
     event_id = {name: i + 1 for i, name in enumerate(grouped_annotations)}
 
@@ -297,60 +295,76 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
     if include_csd:
         ds.append(("csd", csd_data))
     for source, data in ds:
-        for group, anns in grouped_annotations.items():
-            if (source, group) not in colonies:
-                colonies[(source, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+        if use_epochs:
+            for group, anns in grouped_annotations.items():
+                if (source, group) not in colonies:
+                    colonies[(source, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
 
-            colony = colonies[(source, group)]
+                colony = colonies[(source, group)]
 
-            for start_time, end_time in anns:
-                sample = data[:, int(start_time * sfreq):int(end_time * sfreq)]
+                for start_time, end_time in anns:
+                    sample = data[:, int(start_time * sfreq):int(end_time * sfreq)]
 
-                if sample.shape[1] < timestep * sfreq:
-                    continue
+                    if sample.shape[1] < timestep * sfreq:
+                        continue
 
-                colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+                    colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+        else:
+            if data.shape[1] >= timestep * sfreq:
+                colonies[(source, "")] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                colonies[(source, "")].feed(data, step=int(timestep * sfreq), sfreq=sfreq)
 
     if not include_inverse:
         return colonies
 
-    max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
-    ann_list = []
-    event_rows = []
-    
-    for group, anns in grouped_annotations.items():
-        code = event_id[group]
-        for st, et in anns:
-            ann_list.append((group, et - st))
-            event_rows.append([int(st * sfreq), 0, code])
-    
-    sorted_pairs = sorted(zip(event_rows, ann_list), key=lambda p: p[0][0])
-    event_rows, ann_list = zip(*sorted_pairs)
-    events = np.array(event_rows)
+    if use_epochs:
+        max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
+        ann_list = []
+        event_rows = []
 
-    epochs = mne.Epochs(raw, events, event_id=event_id,
-        tmin=0, tmax=max_dur, baseline=None, preload=True, verbose=False)
-    ann_list = [ann_list[i] for i in epochs.selection]
-    stc_gen = apply_inverse_epochs(epochs, prepared_inv,
-        lambda2=lambda2,
-        method="dSPM", prepared=True,
-        return_generator=True)
+        for group, anns in grouped_annotations.items():
+            code = event_id[group]
+            for st, et in anns:
+                ann_list.append((group, et - st))
+                event_rows.append([int(st * sfreq), 0, code])
 
-    for stc, (group, dur) in zip(stc_gen, ann_list):
-        actual_samples = min(int(dur * sfreq), stc.data.shape[1])
-        sample = stc.data[:, :actual_samples]
+        sorted_pairs = sorted(zip(event_rows, ann_list), key=lambda p: p[0][0])
+        event_rows, ann_list = zip(*sorted_pairs)
+        events = np.array(event_rows)
 
-        if sample.shape[1] < timestep * sfreq:
-            continue
+        mne_epochs = mne.Epochs(raw, events, event_id=event_id,
+            tmin=0, tmax=max_dur, baseline=None, preload=True, verbose=False)
+        ann_list = [ann_list[i] for i in mne_epochs.selection]
+        stc_gen = apply_inverse_epochs(mne_epochs, prepared_inv,
+            lambda2=lambda2,
+            method="dSPM", prepared=True,
+            return_generator=True)
 
-        if ("inverse", group) not in colonies:
-            colonies[("inverse", group)] = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+        for stc, (group, dur) in zip(stc_gen, ann_list):
+            actual_samples = min(int(dur * sfreq), stc.data.shape[1])
+            sample = stc.data[:, :actual_samples]
 
-        colony = colonies[("inverse", group)]
+            if sample.shape[1] < timestep * sfreq:
+                continue
 
-        colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
-        colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
-    
+            if ("inverse", group) not in colonies:
+                colonies[("inverse", group)] = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+
+            colony = colonies[("inverse", group)]
+
+            colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+            colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
+    else:
+        stc = apply_inverse_raw(raw, prepared_inv, lambda2=lambda2,
+            method="dSPM", prepared=True)
+        sample = stc.data
+
+        if sample.shape[1] >= timestep * sfreq:
+            colonies[("inverse", "")] = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+            colony = colonies[("inverse", "")]
+            colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+            colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
+
     return colonies
 
 if __name__ == "__main__":
