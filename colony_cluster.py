@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 import mne
 mne.set_log_level("WARNING")
 from mne.minimum_norm import prepare_inverse_operator
@@ -7,6 +8,8 @@ from tqdm import tqdm
 from colony import Colony, build_hemisphere_mirror_map, compute_gain, load_subject, read_subject_record, setup_inverse, BANDS, DATASET_SPECS, TIMESTEP
 import numpy as np
 from collections import defaultdict
+
+INTERACTIVE = sys.stderr.isatty()
 
 reference_colonies = [
     "task1_real_left_fist",
@@ -46,7 +49,8 @@ for dataset, subjects in test_eeg.items():
     dataset_confusion = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     subject_results = {}
 
-    for subject, record_indices in tqdm(subjects.items(), desc="Subjects"):
+    for subject, record_indices in tqdm(subjects.items(), desc="Subjects", disable=not INTERACTIVE):
+        print(f"Subject: {subject}")
         subject_baseline_file, subject_active_files = load_subject(dataset, subject)
         raw_baseline, _ = read_subject_record(dataset, subject_baseline_file)
 
@@ -68,7 +72,8 @@ for dataset, subjects in test_eeg.items():
         subject_confusion = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         subject_cosines = []
 
-        for band_name, band in tqdm(BANDS.items(), desc=f"{subject} bands", leave=False):
+        for band_name, band in tqdm(BANDS.items(), desc=f"{subject} bands", leave=False, disable=not INTERACTIVE):
+            print(f"  Band: {band_name}")
             low = band["low"]
             high = min(band["high"], raw_baseline.info["sfreq"] / 2 - 1)
 
@@ -84,12 +89,13 @@ for dataset, subjects in test_eeg.items():
                     ref_cache[(source_type, ref)] = cluster_colony.pos_weights()
 
             for r_id in record_indices:
+                print(f"    Record: {r_id}")
                 raw_record, _ = read_subject_record(dataset, subject_active_files[r_id])
                 raw_filtered = raw_record.copy()
                 raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
 
                 n_windows = int(raw_filtered.duration // WINDOW_LENGTH)
-                for i in tqdm(range(n_windows), desc=f"{band_name} r{r_id}", leave=False):
+                for i in tqdm(range(n_windows), desc=f"{band_name} r{r_id}", leave=False, disable=not INTERACTIVE):
                     start_time = i * WINDOW_LENGTH
                     end_time = start_time + WINDOW_LENGTH
 
