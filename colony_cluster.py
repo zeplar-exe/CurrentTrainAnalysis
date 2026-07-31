@@ -70,7 +70,7 @@ for dataset, subjects in test_eeg.items():
         inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
 
         subject_confusion = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        subject_cosines = []
+        subject_entries = []
 
         for band_name, band in tqdm(BANDS.items(), desc=f"{subject} bands", leave=False, disable=not INTERACTIVE):
             print(f"  Band: {band_name}")
@@ -86,7 +86,9 @@ for dataset, subjects in test_eeg.items():
                     cluster_values = cluster_df["value"].values
                     cluster_colony = Colony(len(cluster_values), include_pos=True)
                     cluster_colony.colony_pos = cluster_values
-                    ref_cache[(source_type, ref)] = cluster_colony.pos_weights()
+                    weights = cluster_colony.pos_weights()
+                    threshold = np.quantile(weights, 0.75)
+                    ref_cache[(source_type, ref)] = (weights, set(np.where(weights >= threshold)[0]))
 
             for r_id in record_indices:
                 print(f"    Record: {r_id}")
@@ -96,6 +98,7 @@ for dataset, subjects in test_eeg.items():
 
                 n_windows = int(raw_filtered.duration // WINDOW_LENGTH)
                 for i in tqdm(range(n_windows), desc=f"{band_name} r{r_id}", leave=False, disable=not INTERACTIVE):
+                    print(f"      Window: {i+1}/{n_windows}")
                     start_time = i * WINDOW_LENGTH
                     end_time = start_time + WINDOW_LENGTH
 
@@ -109,32 +112,38 @@ for dataset, subjects in test_eeg.items():
 
                     for (source, _), colony in colonies.items():
                         colony_weights = colony.pos_weights()
+                        colony_threshold = np.quantile(colony_weights, 0.75)
+                        colony_top = set(np.where(colony_weights >= colony_threshold)[0])
 
                         best_ref = None
-                        best_cosine = -1.0
+                        best_overlap = -1.0
+                        best_distance = np.inf
 
                         for ref in reference_colonies:
-                            cluster_weights = ref_cache[(source, ref)]
-                            norm_product = np.linalg.norm(cluster_weights) * np.linalg.norm(colony_weights)
-                            cosine_sim = np.dot(cluster_weights, colony_weights) / norm_product if norm_product > 0 else 0.0
+                            cluster_weights, ref_top = ref_cache[(source, ref)]
 
-                            if cosine_sim > best_cosine:
-                                best_cosine = cosine_sim
+                            overlap = len(ref_top & colony_top) / len(ref_top | colony_top) if ref_top | colony_top else 0.0
+                            distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
+
+                            if overlap > best_overlap or (overlap == best_overlap and distance < best_distance):
+                                best_overlap = overlap
+                                best_distance = distance
                                 best_ref = ref
 
                         if best_ref is not None:
                             subject_confusion[source][band_name][(true_event, best_ref)] += 1
                             dataset_confusion[source][band_name][(true_event, best_ref)] += 1
-                            subject_cosines.append({
+                            subject_entries.append({
                                 "source": source,
                                 "band": band_name,
                                 "true": true_event,
                                 "predicted": best_ref,
                                 "correct": true_event == best_ref,
-                                "cosine": best_cosine,
+                                "overlap": best_overlap,
+                                "distance": best_distance,
                             })
 
-        subject_results[subject] = subject_cosines
+        subject_results[subject] = subject_entries
 
         print(f"\n{'='*60}")
         print(f"Subject: {subject}")
@@ -171,27 +180,22 @@ for dataset, subjects in test_eeg.items():
             
             print(f"    {band_name}: {correct}/{total} ({acc:.1%})")
 
-            for true_event in reference_colonies:
-                row_total = sum(v for (t, p), v in confusion.items() if t == true_event)
-                
-                if row_total == 0:
-                    continue
-                
+            for true_event in sorted({t for t, _ in confusion}):
                 preds = {p: v for (t, p), v in confusion.items() if t == true_event}
-                pred_str = "  ".join(f"{p.split('_', 1)[1][:20]}={v}" for p, v in sorted(preds.items(), key=lambda x: -x[1]))
+                row_total = sum(preds.values())
                 row_correct = preds.get(true_event, 0)
-                
-                print(f"      {true_event}: {row_correct}/{row_total} ({row_correct/row_total:.0%})  [{pred_str}]")
+                pred_str = "  ".join(f"{p}={v}" for p, v in sorted(preds.items(), key=lambda x: -x[1]))
+                marker = "*" if true_event in reference_colonies else " "
+                print(f"     {marker}{true_event}: {row_correct}/{row_total}  [{pred_str}]")
 
         all_entries = [e for subj in subject_results.values() for e in subj if e["source"] == source]
         
         if all_entries:
-            correct_cosines = [e["cosine"] for e in all_entries if e["correct"]]
-            wrong_cosines = [e["cosine"] for e in all_entries if not e["correct"]]
-            if correct_cosines:
-                print(f"    correct match cosine: mean={np.mean(correct_cosines):.4f}  std={np.std(correct_cosines):.4f}")
-            if wrong_cosines:
-                print(f"    wrong match cosine:   mean={np.mean(wrong_cosines):.4f}  std={np.std(wrong_cosines):.4f}")
+            for label, filt in [("correct", True), ("wrong", False)]:
+                subset = [e for e in all_entries if e["correct"] == filt]
+                if subset:
+                    print(f"    {label}: overlap={np.mean([e['overlap'] for e in subset]):.4f}±{np.std([e['overlap'] for e in subset]):.4f}"
+                          f"  dist={np.mean([e['distance'] for e in subset]):.4f}±{np.std([e['distance'] for e in subset]):.4f}")
 
     print(f"\n  Per-subject accuracy:")
     for subject, entries in subject_results.items():
