@@ -1,11 +1,17 @@
 from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, apply_inverse_epochs, write_inverse_operator, read_inverse_operator, make_inverse_operator
 import mne
+from mne.minimum_norm import InverseOperator
 import numpy as np
+from numpy.typing import NDArray
 import scipy
 from scipy.spatial import KDTree
 from pathlib import Path
 from rich.live import Live
 from rich.panel import Panel
+from typing import Literal
+
+Source = Literal["vol", "csd", "inverse"]
+ColonyMap = dict[tuple[Source, str], "Colony"]
 
 DATASET_SPECS = {
     "eegmmidb": {
@@ -176,9 +182,6 @@ def fix_raw(dataset, raw):
     ica.exclude = muscle_idx
     raw = ica.apply(raw.copy())
     
-    if dataset == "eegmmidb":
-        raw = raw
-
     if dataset == "physionet":
         case_fixing_map = {
             'Fc5': 'FC5', 'Fc3': 'FC3', 'Fc1': 'FC1', 'Fcz': 'FCz', 'Fc2': 'FC2', 'Fc4': 'FC4', 'Fc6': 'FC6',
@@ -263,6 +266,93 @@ def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False):
     
     return inverse_operator, src, bem 
 
+def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArray,
+                 inverse_mirror_map: NDArray[np.intp], lambda2: float, timestep: float,
+                 include_vol: bool = False, include_csd: bool = False, include_inverse: bool = False,
+                 include_raw: bool = False, include_abs: bool = False,
+                 include_pos: bool = False, include_neg: bool = False,
+                 use_epochs: bool = True) -> ColonyMap:
+    colonies = {}
+    sfreq = raw.info["sfreq"]
+
+    grouped_annotations = {}
+    
+    if use_epochs:
+        for annotation in raw.annotations:
+            group = annotation["description"].item().strip()
+            if group not in grouped_annotations:
+                grouped_annotations[group] = []
+            grouped_annotations[group].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
+    else:
+        grouped_annotations[""] = [(0, raw.duration)]
+
+    event_id = {name: i + 1 for i, name in enumerate(grouped_annotations)}
+
+    csd_data = mne.preprocessing.compute_current_source_density(raw.copy()).get_data()
+    vol_data = raw.get_data()
+
+    ds = []
+    if include_vol:
+        ds.append(("vol", vol_data))
+    if include_csd:
+        ds.append(("csd", csd_data))
+    for source, data in ds:
+        for group, anns in grouped_annotations.items():
+            if (source, group) not in colonies:
+                colonies[(source, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+
+            colony = colonies[(source, group)]
+
+            for start_time, end_time in anns:
+                sample = data[:, int(start_time * sfreq):int(end_time * sfreq)]
+
+                if sample.shape[1] < timestep * sfreq:
+                    continue
+
+                colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+
+    if not include_inverse:
+        return colonies
+
+    max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
+    ann_list = []
+    event_rows = []
+    
+    for group, anns in grouped_annotations.items():
+        code = event_id[group]
+        for st, et in anns:
+            ann_list.append((group, et - st))
+            event_rows.append([int(st * sfreq), 0, code])
+    
+    sorted_pairs = sorted(zip(event_rows, ann_list), key=lambda p: p[0][0])
+    event_rows, ann_list = zip(*sorted_pairs)
+    events = np.array(event_rows)
+
+    epochs = mne.Epochs(raw, events, event_id=event_id,
+        tmin=0, tmax=max_dur, baseline=None, preload=True, verbose=False)
+    ann_list = [ann_list[i] for i in epochs.selection]
+    stc_gen = apply_inverse_epochs(epochs, prepared_inv,
+        lambda2=lambda2,
+        method="dSPM", prepared=True,
+        return_generator=True)
+
+    for stc, (group, dur) in zip(stc_gen, ann_list):
+        actual_samples = min(int(dur * sfreq), stc.data.shape[1])
+        sample = stc.data[:, :actual_samples]
+
+        if sample.shape[1] < timestep * sfreq:
+            continue
+
+        if ("inverse", group) not in colonies:
+            colonies[("inverse", group)] = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+
+        colony = colonies[("inverse", group)]
+
+        colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+        colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
+    
+    return colonies
+
 if __name__ == "__main__":
     with Live(Panel("Initializing...", expand=False), auto_refresh=True) as live:
         target_datasets = ["eegmmidb"]
@@ -278,45 +368,27 @@ if __name__ == "__main__":
                 
                 inv, src, bem = setup_inverse(dataset, subject, raw_baseline)
                 snr = 3.0
+                lambda2 = 1.0 / (snr ** 2)
                 prepared_inv = prepare_inverse_operator(
-                    inv, 
-                    nave=1, 
-                    lambda2=1.0 / (snr ** 2)
+                    inv,
+                    nave=1,
+                    lambda2=lambda2
                 )
-                
-                src_data = mne.read_source_spaces(src)
-                        
-                colonies = {}
 
-                lh_vertno = inv['src'][0]['vertno']
-                rh_vertno = inv['src'][1]['vertno']
-                n_vertices = len(lh_vertno) + len(rh_vertno)
-                inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
+                src_data = mne.read_source_spaces(src)
+                inverse_mirror_map = build_hemisphere_mirror_map(src_data, inv['src'][0]['vertno'], inv['src'][1]['vertno'])
+
+                colonies = {}
 
                 include_raw = False
                 include_abs = False
                 include_pos = True
                 include_neg = True
 
-                reverse_event_ids = {v: k for k, v in DATASET_SPECS[dataset]["event_ids"].items()
-                                     if k not in spec.get("ignore_events", [])}
-
                 target_records = subject_active_files[:20]
                 for record_index, record in enumerate(target_records):
-                    raw_active, events_active = read_subject_record(dataset, record)
-
-                    grouped_annotations = {}
-                    annotations_active = raw_active.annotations
-
-                    for annotation in annotations_active:
-                        desc = int(annotation["description"].item().strip())
-                        key = DATASET_SPECS[dataset]["event_ids"][desc]
-
-                        if key not in grouped_annotations:
-                            grouped_annotations[key] = []
-                        grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
-
-                    print(f"Grouped Annotations: {grouped_annotations}")
+                    raw_active, _ = read_subject_record(dataset, record)
+                    raw_active.annotations.description = np.array([spec["event_ids"][int(a["description"].item().strip())] for a in raw_active.annotations])
 
                     sfreq = raw_active.info["sfreq"]
 
@@ -336,59 +408,18 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
                         raw_filtered = raw_active.copy()
                         raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
 
-                        csd_data = mne.preprocessing.compute_current_source_density(raw_filtered.copy()).get_data()
-                        vol_data = raw_filtered.get_data()
+                        new_colonies = compute_gain(prepared_inv, raw_filtered,
+                                                    inverse_mirror_map, lambda2, TIMESTEP,
+                                                    include_vol=True, include_csd=True,
+                                                    include_inverse=True,
+                                                    include_raw=include_raw, include_abs=include_abs,
+                                                    include_pos=include_pos, include_neg=include_neg)
 
-                        for source, data in [("vol", vol_data), ("csd", csd_data)]:
-                            for group, annotations in grouped_annotations.items():
-                                if (source, band_name, group) not in colonies:
-                                    colonies[(source, band_name, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
-                                
-                                colony = colonies[(source, band_name, group)]
-                                
-                                for start_time, end_time in annotations:
-                                    sample = data[:, int(start_time * sfreq):int(end_time * sfreq)]
-                                    
-                                    if sample.shape[1] < TIMESTEP * sfreq:
-                                        continue
-                                    
-                                    colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
+                        for (source, group), new_colony in new_colonies.items():
+                            colonies[(source, band_name, group)] = new_colony
 
-                        event_id = {g: reverse_event_ids[g] for g in grouped_annotations}
-                        max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
-
-                        ann_durations = {}
-                        for group, anns in grouped_annotations.items():
-                            for st, et in anns:
-                                ann_durations[(reverse_event_ids[group], int(st * sfreq))] = et - st
-
-                        epochs = mne.Epochs(raw_filtered, events_active, event_id=event_id,
-                                            tmin=0, tmax=max_dur, baseline=None, preload=True, verbose=False)
-                        stc_gen = apply_inverse_epochs(epochs, prepared_inv,
-                                                       lambda2=1.0 / (snr ** 2),
-                                                       method="dSPM", prepared=True,
-                                                       return_generator=True)
-
-                        for stc, event_row in zip(stc_gen, epochs.events):
-                            event_code = event_row[2]
-                            onset_sample = event_row[0]
-                            group = DATASET_SPECS[dataset]["event_ids"][event_code]
-
-                            actual_dur = ann_durations.get((event_code, onset_sample), max_dur)
-                            actual_samples = min(int(actual_dur * sfreq), stc.data.shape[1])
-                            sample = stc.data[:, :actual_samples]
-
-                            if sample.shape[1] < TIMESTEP * sfreq:
-                                continue
-
-                            if ("inverse", band_name, group) not in colonies:
-                                colonies[("inverse", band_name, group)] = Colony(n_vertices, include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
-                            
-                            colony = colonies[("inverse", band_name, group)]
-
-                            colony.feed(sample, step=int(TIMESTEP * sfreq), sfreq=sfreq)
-                            colony.feed(sample[inverse_mirror_map, :], step=int(TIMESTEP * sfreq), sfreq=sfreq)
-
+                lh_vertno = inv['src'][0]['vertno']
+                rh_vertno = inv['src'][1]['vertno']
                 lh_coordinates = src_data[0]['rr'][lh_vertno]
                 rh_coordinates = src_data[1]['rr'][rh_vertno]
 
@@ -449,7 +480,7 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 
 # WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
 # also: let's just find the 32, 64, 128 datasets we want to use so we're not limited to MI
-    # + refactor _read_csv_record to be eegmbdi-specific (remove the glob in the spec and put it here)
+    # + refactor _read_csv_record to be eegmmidb-specific (remove the glob in the spec and put it here)
 # + ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
 # how do we choose when to mirror and when not to mirror during colony growth?
 # looks like we have an unsupervised clusterer on our hands: test by collecting colony on some arbitrary event (or relaxation) 
