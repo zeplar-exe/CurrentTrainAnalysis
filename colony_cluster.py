@@ -2,7 +2,7 @@ from pathlib import Path
 import mne
 from mne.minimum_norm import prepare_inverse_operator
 import pandas as pd
-from colony import build_hemisphere_mirror_map, compute_gain, load_subject, read_subject_record, setup_inverse, BANDS, DATASET_SPECS, TIMESTEP
+from colony import Colony, Colony, build_hemisphere_mirror_map, compute_gain, load_subject, read_subject_record, setup_inverse, BANDS, DATASET_SPECS, TIMESTEP
 import numpy as np
 
 reference_colonies = [
@@ -75,9 +75,13 @@ for dataset, subjects in test_eeg.items():
                                 continue
                             cluster_df = pd.read_csv(cluster_path)
                             cluster_values = cluster_df["value"].values
+                            cluster_colony = Colony(len(cluster_values), include_pos=True, include_neg=False)
+                            cluster_colony.colony_pos = cluster_values
 
-                            weights = colony.pos_weights()
-                            distance = np.sqrt(np.sum(weights * (cluster_values - colony.colony_pos) ** 2))
+                            cluster_weights = cluster_colony.pos_weights()
+                            colony_weights = colony.pos_weights()
+                            
+                            distance = np.sqrt(np.sum(cluster_weights * (cluster_weights - colony_weights) ** 2))
                             distances[ref].append({
                                 "source": source,
                                 "band": band_name,
