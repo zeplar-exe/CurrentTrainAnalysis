@@ -442,7 +442,7 @@ if __name__ == "__main__":
         target_datasets = ["grasplift"]
         for dataset_index, dataset in enumerate(target_datasets):
             spec = get_dataset_spec(dataset)
-            target_subjects = spec["subjects"][:10]
+            target_subjects = spec["subjects"][:6]
             for subject_index, subject in enumerate(target_subjects):
                 subject_baseline_file, subject_active_files = load_subject(dataset, subject)
                 raw_baseline, events_baseline = read_subject_record(dataset, subject_baseline_file)

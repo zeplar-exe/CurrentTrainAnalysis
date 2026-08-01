@@ -1,4 +1,4 @@
-from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, write_inverse_operator, read_inverse_operator, make_inverse_operator
+from mne.minimum_norm import prepare_inverse_operator, apply_inverse_epochs, write_inverse_operator, read_inverse_operator, make_inverse_operator
 import mne
 import sys
 from scipy.spatial import KDTree
@@ -104,7 +104,8 @@ def generate_sphere_centers(coordinates: np.ndarray, r: float, k: int):
 
 def generate_subject_data():
     target_subjects = {
-        "eegmmidb": ["S001", "S002", "S003", "S004", "S005", "S006", "S007", "S008", "S009", "S010"],
+        #"eegmmidb": ["S001", "S002", "S003", "S004", "S005", "S006", "S007", "S008", "S009", "S010"],
+        "grasplift": ["subj1", "subj2", "subj3", "subj4"],
     }
 
     for dataset, subjects in target_subjects.items():
@@ -143,6 +144,21 @@ def generate_subject_data():
                         grouped_annotations[key] = []
                     grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
 
+                event_id = {name: i + 1 for i, name in enumerate(grouped_annotations)}
+                max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
+
+                ann_list = []
+                event_rows = []
+                for group, anns in grouped_annotations.items():
+                    code = event_id[group]
+                    for st, et in anns:
+                        ann_list.append((group, et - st))
+                        event_rows.append([int(st * sfreq), 0, code])
+
+                sorted_pairs = sorted(zip(event_rows, ann_list), key=lambda p: p[0][0])
+                event_rows, ann_list = zip(*sorted_pairs)
+                events = np.array(event_rows)
+
                 for band_name, band in BANDS.items():
                     print(f"    Band: {band_name}")
                     low = band["low"]
@@ -150,16 +166,23 @@ def generate_subject_data():
                     raw_filtered = raw_active.copy()
                     raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
 
-                    stc = apply_inverse_raw(
-                        raw_filtered, prepared_inv,
-                        lambda2=lambda2, buffer_size=5000,
-                        method="dSPM", prepared=True
-                    )
-                    stc_data = stc.data
+                    mne_epochs = mne.Epochs(raw_filtered, events, event_id=event_id,
+                        tmin=0, tmax=max_dur, baseline=None, preload=True,
+                        event_repeated="merge", verbose=False)
+                    kept_ann_list = [ann_list[i] for i in mne_epochs.selection]
+
+                    stc_gen = apply_inverse_epochs(mne_epochs, prepared_inv,
+                        lambda2=lambda2, method="dSPM", prepared=True,
+                        return_generator=True)
+
+                    epoch_data = defaultdict(list)
+                    for stc, (group, dur) in zip(stc_gen, kept_ann_list):
+                        actual_samples = min(int(dur * sfreq), stc.data.shape[1])
+                        epoch_data[group].append(stc.data[:, :actual_samples])
 
                     for timestep, cluster_window in itertools.product(TIMESTEPS, CLUSTER_WINDOWS):
                         timestep_ms = timestep / 1000
-                        for group, annotations in grouped_annotations.items():
+                        for group, samples in epoch_data.items():
                             output_path = subject_path / band_name / f"t{timestep}c{cluster_window}" / group / f"record_{record_index}.npy"
                             output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -167,10 +190,8 @@ def generate_subject_data():
                             poss = []
                             negs = []
 
-                            largest_end_index = int(max((et - st) for st, et in annotations) * sfreq)
-                            for start_time, end_time in annotations:
-                                sample = stc_data[:, int(start_time * sfreq):int(end_time * sfreq)]
-
+                            largest_end_index = max(s.shape[1] for s in samples)
+                            for sample in samples:
                                 if sample.shape[1] < largest_end_index:
                                     padding = np.zeros((sample.shape[0], largest_end_index - sample.shape[1]))
                                     sample = np.hstack([sample, padding])
