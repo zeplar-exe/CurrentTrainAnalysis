@@ -23,10 +23,10 @@ reference_colonies = {
     #    "task4_imagine_both_fists"
     #],
     "grasplift": [
-        "grasp_HandStart",
-        "grasp_FirstDigitTouch",
-        "grasp_LiftOff",
-        "grasp_Replace",
+        "HandStart",
+        "FirstDigitTouch",
+        "LiftOff",
+        # "Replace",
     ]
 }
 
@@ -34,13 +34,23 @@ test_eeg = {
     "eegmmidb": {
         "S011": [0, 1, 2, 3, 4, 5],
         "S012": [0, 1, 2, 3, 4, 5],
-        "S013": [0, 1, 2, 3, 4, 5],
-        "S014": [0, 1, 2, 3, 4, 5],
-        "S015": [0, 1, 2, 3, 4, 5],
+        #"S013": [0, 1, 2, 3, 4, 5],
+        #"S014": [0, 1, 2, 3, 4, 5],
+        #"S015": [0, 1, 2, 3, 4, 5],
+    },
+    "grasplift": {
+        "subj1": [0, 1, 2, 3, 4, 5],
+        "subj2": [0, 1, 2, 3, 4, 5],
+        "subj9": [0, 1, 2, 3, 4, 5],
+        "subj10": [0, 1, 2, 3, 4, 5],
+        "subj11": [0, 1, 2, 3, 4, 5],
+        "subj12": [0, 1, 2, 3, 4, 5],
     }
 }
 
 WINDOW_LENGTH = 1000 / 1000
+
+PERCENTILES = [(0.5, 0.99), (0.75, 0.99), (0.85, 0.99), (0.95, 0.99), (0.5, 0.95), (0.75, 0.95), (0.85, 0.95), (0.5, 0.85)]
 
 def get_window_event(raw, start_time, end_time, spec):
     for annotation in raw.annotations:
@@ -142,29 +152,39 @@ for dataset, subjects in test_eeg.items():
 
             
                 def get_source_overlap(source):
-                    overlaps = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-                    distance = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+                    overlaps = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
+                    distance = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
 
                     for band_name, colony in band_data[source].items():
                         pos_weights = colony.pos_weights()
                         neg_weights = colony.neg_weights()
-                        pos_threshold = np.quantile(pos_weights, 0.75)
-                        neg_threshold = np.quantile(neg_weights, 0.75)
-                        pos_top = set(np.where(pos_weights >= pos_threshold)[0])
-                        neg_top = set(np.where(neg_weights >= neg_threshold)[0])
 
                         for ref, ref_colony in ref_cache[source][band_name].items():
                             ref_pos_weights = ref_colony.pos_weights()
                             ref_neg_weights = ref_colony.neg_weights()
-                            ref_pos_top = set(np.where(ref_pos_weights >= np.quantile(ref_pos_weights, 0.75))[0])
-                            ref_neg_top = set(np.where(ref_neg_weights >= np.quantile(ref_neg_weights, 0.75))[0])
 
-                            pos_union = pos_top | ref_pos_top
-                            neg_union = neg_top | ref_neg_top
-                            overlaps[ref]["pos"][band_name] = len(pos_top & ref_pos_top) / len(pos_union) if pos_union else 0.0
-                            overlaps[ref]["neg"][band_name] = len(neg_top & ref_neg_top) / len(neg_union) if neg_union else 0.0
-                            distance[ref]["pos"][band_name] = np.sqrt(np.sum(pos_weights * abs((pos_weights - ref_pos_weights)) ** 2))
-                            distance[ref]["neg"][band_name] = np.sqrt(np.sum(neg_weights * abs((neg_weights - ref_neg_weights)) ** 2))
+                            for pstart, pend in PERCENTILES:
+                                pkey = (pstart, pend)
+
+                                pos_lo, pos_hi = np.quantile(pos_weights, pstart), np.quantile(pos_weights, pend)
+                                neg_lo, neg_hi = np.quantile(neg_weights, pstart), np.quantile(neg_weights, pend)
+                                pos_top = set(np.where((pos_weights >= pos_lo) & (pos_weights <= pos_hi))[0])
+                                neg_top = set(np.where((neg_weights >= neg_lo) & (neg_weights <= neg_hi))[0])
+
+                                ref_pos_lo, ref_pos_hi = np.quantile(ref_pos_weights, pstart), np.quantile(ref_pos_weights, pend)
+                                ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_weights, pstart), np.quantile(ref_neg_weights, pend)
+                                ref_pos_top = set(np.where((ref_pos_weights >= ref_pos_lo) & (ref_pos_weights <= ref_pos_hi))[0])
+                                ref_neg_top = set(np.where((ref_neg_weights >= ref_neg_lo) & (ref_neg_weights <= ref_neg_hi))[0])
+
+                                pos_union = pos_top | ref_pos_top
+                                neg_union = neg_top | ref_neg_top
+                                overlaps[ref]["pos"][band_name][pkey] = len(pos_top & ref_pos_top) / len(pos_union) if pos_union else 0.0
+                                overlaps[ref]["neg"][band_name][pkey] = len(neg_top & ref_neg_top) / len(neg_union) if neg_union else 0.0
+
+                                pos_sel = list(pos_top | ref_pos_top)
+                                neg_sel = list(neg_top | ref_neg_top)
+                                distance[ref]["pos"][band_name][pkey] = np.sqrt(np.sum((pos_weights[pos_sel] - ref_pos_weights[pos_sel]) ** 2)) if pos_sel else 0.0
+                                distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_weights[neg_sel] - ref_neg_weights[neg_sel]) ** 2)) if neg_sel else 0.0
 
                     return overlaps, distance
                 
@@ -179,17 +199,26 @@ for dataset, subjects in test_eeg.items():
                 for ref in all_refs:
                     score = 0.0
                     for source_type, (overlaps, _) in source_results.items():
-                        score += np.mean(list(overlaps[ref]["pos"].values()))
-                        score += np.mean(list(overlaps[ref]["neg"].values()))
+                        for sign in ["pos", "neg"]:
+                            for band_vals in overlaps[ref][sign].values():
+                                for pkey in PERCENTILES:
+                                    score += band_vals[pkey]
 
                     if score > best_score:
                         best_score = score
                         best_ref = ref
 
-                best_distance = 0.0
-                for source_type, (_, distances) in source_results.items():
-                    best_distance += sum(distances[best_ref]["pos"].values())
-                    best_distance += sum(distances[best_ref]["neg"].values())
+                pct_metrics = {}
+                for pkey in PERCENTILES:
+                    pct_overlap = 0.0
+                    pct_distance = 0.0
+                    for source_type, (overlaps, distances) in source_results.items():
+                        for sign in ["pos", "neg"]:
+                            band_overlaps = [overlaps[best_ref][sign][bn][pkey] for bn in overlaps[best_ref][sign]]
+                            band_dists = [distances[best_ref][sign][bn][pkey] for bn in distances[best_ref][sign]]
+                            pct_overlap += np.mean(band_overlaps) if band_overlaps else 0.0
+                            pct_distance += sum(band_dists)
+                    pct_metrics[pkey] = {"overlap": pct_overlap, "distance": pct_distance}
 
                 subject_confusion[(true_event, best_ref)] += 1
                 dataset_confusion[(true_event, best_ref)] += 1
@@ -197,8 +226,7 @@ for dataset, subjects in test_eeg.items():
                     "true": true_event,
                     "predicted": best_ref,
                     "correct": true_event == best_ref,
-                    "overlap": best_score,
-                    "distance": best_distance,
+                    "percentiles": pct_metrics,
                 })
 
         subject_results[subject] = subject_entries
@@ -222,10 +250,12 @@ for dataset, subjects in test_eeg.items():
         for label, filt in [("correct", True), ("wrong", False)]:
             subset = [e for e in subject_entries if e["correct"] == filt]
             if subset:
-                overlaps = [e["overlap"] for e in subset]
-                dists = [e["distance"] for e in subset]
-                print(f"  {label}: overlap={np.mean(overlaps):.4f}±{np.std(overlaps):.4f}"
-                      f"  dist={np.mean(dists):.4f}±{np.std(dists):.4f}")
+                print(f"  {label}:")
+                for pkey in PERCENTILES:
+                    overlaps = [e["percentiles"][pkey]["overlap"] for e in subset]
+                    dists = [e["percentiles"][pkey]["distance"] for e in subset]
+                    print(f"    {pkey[0]:.0%}-{pkey[1]:.0%}: overlap={np.mean(overlaps):.4f}±{np.std(overlaps):.4f}"
+                          f"  dist={np.mean(dists):.4f}±{np.std(dists):.4f}")
 
     total = sum(dataset_confusion.values())
     correct = sum(v for (t, p), v in dataset_confusion.items() if t == p)
@@ -247,10 +277,12 @@ for dataset, subjects in test_eeg.items():
     for label, filt in [("correct", True), ("wrong", False)]:
         subset = [e for e in all_entries if e["correct"] == filt]
         if subset:
-            overlaps = [e["overlap"] for e in subset]
-            dists = [e["distance"] for e in subset]
-            print(f"  {label}: overlap={np.mean(overlaps):.4f}±{np.std(overlaps):.4f}"
-                  f"  dist={np.mean(dists):.4f}±{np.std(dists):.4f}")
+            print(f"  {label}:")
+            for pkey in PERCENTILES:
+                overlaps = [e["percentiles"][pkey]["overlap"] for e in subset]
+                dists = [e["percentiles"][pkey]["distance"] for e in subset]
+                print(f"    {pkey[0]:.0%}-{pkey[1]:.0%}: overlap={np.mean(overlaps):.4f}±{np.std(overlaps):.4f}"
+                      f"  dist={np.mean(dists):.4f}±{np.std(dists):.4f}")
 
     print(f"\n  Per-subject:")
     for subject, entries in subject_results.items():
