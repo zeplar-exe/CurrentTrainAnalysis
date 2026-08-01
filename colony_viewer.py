@@ -33,7 +33,6 @@ def load(path):
     df.columns = ["x", "y", "z", "value"]
     return df, "xyz"
 
-
 def get_montage_positions():
     montage = mne.channels.make_standard_montage("standard_1005")
     positions = montage.get_positions()["ch_pos"]

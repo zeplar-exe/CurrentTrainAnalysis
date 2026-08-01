@@ -12,7 +12,7 @@ from hmmlearn import hmm
 import torch
 from umap.parametric_umap import ParametricUMAP
 from sklearn.decomposition import IncrementalPCA
-from colony import DATASET_SPECS, load_subject, read_subject_record, setup_inverse
+from colony import DATASET_SPECS, BANDS, load_subject, read_subject_record, setup_inverse
 from denstream import DenStream
 
 SEED = 42
@@ -109,93 +109,84 @@ def generate_subject_data():
 
     for dataset, subjects in target_subjects.items():
         print(f"Processing dataset: {dataset}")
+        spec = DATASET_SPECS[dataset]
+
         for subject in subjects:
             print(f"Processing subject: {subject}")
             subject_path = Path("growth") / dataset / subject
+            subject_path.mkdir(parents=True, exist_ok=True)
             sub_baseline, sub_active = load_subject(dataset, subject)
             raw_baseline, _ = read_subject_record(dataset, sub_baseline)
 
-            inv, src, bem = setup_inverse("eegmmidb", subject, raw_baseline)
+            inv, src, bem = setup_inverse(dataset, subject, raw_baseline)
             snr = 3.0
-            prepared_inv = prepare_inverse_operator(
-                inv, 
-                nave=1, 
-                lambda2=1.0 / (snr ** 2)
-            )
-            
+            lambda2 = 1.0 / (snr ** 2)
+            prepared_inv = prepare_inverse_operator(inv, nave=1, lambda2=lambda2)
+
             src_data = mne.read_source_spaces(src)
-            
-            lh_vertno = 0
-            rh_vertno = 0
+            lh_vertno = inv['src'][0]['vertno']
+            rh_vertno = inv['src'][1]['vertno']
+            all_xyz_coordinates = np.vstack([src_data[0]['rr'][lh_vertno], src_data[1]['rr'][rh_vertno]])
+            np.save(subject_path / "coordinates.npy", all_xyz_coordinates)
 
             target_records = sub_active[:8]
             for record_index, record in enumerate(target_records):
-                print(f"Processing record: {record_index + 1}/{len(target_records)}")
-                raw_active, events_active = read_subject_record("eegmmidb", record)
+                print(f"  Record: {record_index + 1}/{len(target_records)}")
+                raw_active, _ = read_subject_record(dataset, record)
                 sfreq = int(raw_active.info["sfreq"])
-                
-                grouped_annotations = {}
-                annotations_active = raw_active.annotations
 
-                for annotation in annotations_active:
+                grouped_annotations = {}
+                for annotation in raw_active.annotations:
                     desc = int(annotation["description"].item().strip())
-                    key = DATASET_SPECS["eegmmidb"]["event_ids"][desc]
-                    
+                    key = spec["event_ids"][desc]
                     if key not in grouped_annotations:
                         grouped_annotations[key] = []
                     grouped_annotations[key].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
-                    
-                stc = apply_inverse_raw(
-                    raw_active, 
-                    prepared_inv, 
-                    lambda2=1.0 / (snr ** 2),
-                    buffer_size=5000,
-                    method="dSPM",
-                    prepared=True
-                )
-                stc_data = stc.data
-                
-                lh_vertno = stc.lh_vertno
-                rh_vertno = stc.rh_vertno
-                
-                lh_coordinates = src_data[0]['rr'][lh_vertno]
-                rh_coordinates = src_data[1]['rr'][rh_vertno]
 
-                all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
-                
-                for timestep, cluster_window in itertools.product(TIMESTEPS, CLUSTER_WINDOWS):
-                    print(f"Processing timestep-cluster window: {timestep}-{cluster_window}")
-                    timestep_ms = timestep / 1000
-                    for group, annotations in grouped_annotations.items():
-                        output_path = subject_path / f"t{timestep}c{cluster_window}" / group / f"record_{record_index}.npy"
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        raws = []
-                        poss = []
-                        negs = []
-                        
-                        largest_end_index = int(max((et - st) for st, et in annotations) * sfreq)
-                        for start_time, end_time in annotations:
-                            sample = stc_data[:, int(start_time * sfreq):int(end_time * sfreq)]
-                            
-                            if sample.shape[1] < largest_end_index:
-                                padding = np.zeros((sample.shape[0], largest_end_index - sample.shape[1]))
-                                sample = np.hstack([sample, padding])
-                            
-                            raw_growth, pos_growth, neg_growth = collect(sample, step=int(timestep_ms * sfreq), sfreq=sfreq)
-                            n_full_windows = raw_growth.shape[1] // cluster_window
-                            trim = n_full_windows * cluster_window
-                            raw_split = np.split(raw_growth[:, :trim], n_full_windows, axis=1)
-                            pos_split = np.split(pos_growth[:, :trim], n_full_windows, axis=1)
-                            neg_split = np.split(neg_growth[:, :trim], n_full_windows, axis=1)
+                for band_name, band in BANDS.items():
+                    print(f"    Band: {band_name}")
+                    low = band["low"]
+                    high = min(band["high"], sfreq / 2 - 1)
+                    raw_filtered = raw_active.copy()
+                    raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
 
-                            raws.extend(raw_split)
-                            poss.extend(pos_split)
-                            negs.extend(neg_split)
-                            
-                        np.save(output_path, np.array([np.stack(raws), np.stack(poss), np.stack(negs)]))
-                
-                np.save(subject_path / "coordinates.npy", all_xyz_coordinates)
+                    stc = apply_inverse_raw(
+                        raw_filtered, prepared_inv,
+                        lambda2=lambda2, buffer_size=5000,
+                        method="dSPM", prepared=True
+                    )
+                    stc_data = stc.data
+
+                    for timestep, cluster_window in itertools.product(TIMESTEPS, CLUSTER_WINDOWS):
+                        timestep_ms = timestep / 1000
+                        for group, annotations in grouped_annotations.items():
+                            output_path = subject_path / band_name / f"t{timestep}c{cluster_window}" / group / f"record_{record_index}.npy"
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                            raws = []
+                            poss = []
+                            negs = []
+
+                            largest_end_index = int(max((et - st) for st, et in annotations) * sfreq)
+                            for start_time, end_time in annotations:
+                                sample = stc_data[:, int(start_time * sfreq):int(end_time * sfreq)]
+
+                                if sample.shape[1] < largest_end_index:
+                                    padding = np.zeros((sample.shape[0], largest_end_index - sample.shape[1]))
+                                    sample = np.hstack([sample, padding])
+
+                                raw_growth, pos_growth, neg_growth = collect(sample, step=int(timestep_ms * sfreq), sfreq=sfreq)
+                                n_full_windows = raw_growth.shape[1] // cluster_window
+                                trim = n_full_windows * cluster_window
+                                raw_split = np.split(raw_growth[:, :trim], n_full_windows, axis=1)
+                                pos_split = np.split(pos_growth[:, :trim], n_full_windows, axis=1)
+                                neg_split = np.split(neg_growth[:, :trim], n_full_windows, axis=1)
+
+                                raws.extend(raw_split)
+                                poss.extend(pos_split)
+                                negs.extend(neg_split)
+
+                            np.save(output_path, np.array([np.stack(raws), np.stack(poss), np.stack(negs)]))
 
 def generate_models(for_timestep: int, for_cluster_window: int):
     pass

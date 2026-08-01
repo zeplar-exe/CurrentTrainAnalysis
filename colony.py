@@ -48,7 +48,7 @@ DATASET_SPECS = {
     "grasplift": {
         "root": Path("./datasets/grasplift/train"),
         "sfreq": 500.0,
-        "subjects": [f"subj{i}" for i in range(1, 13)],
+        "subjects": [f"subj{i}" for i in range(1, 12 + 1)],
         "channels": [
             "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
             "FC5", "FC1", "FC2", "FC6",
@@ -209,7 +209,13 @@ def _read_grasplift_record(record: Path, spec: dict):
     descriptions = []
     event_rows = []
 
+    ignore = set(spec.get("ignore_events", []))
+
     for col_idx, event_name in enumerate(event_names):
+        code = name_to_code[event_name]
+        if code in ignore:
+            continue
+
         col = events_data[:, col_idx]
         diff = np.diff(col, prepend=0)
         starts = np.where(diff == 1)[0]
@@ -217,7 +223,6 @@ def _read_grasplift_record(record: Path, spec: dict):
         if len(ends) < len(starts):
             ends = np.append(ends, len(col))
 
-        code = name_to_code[event_name]
         for s, e in zip(starts, ends):
             onset_time = s / spec["sfreq"]
             dur = min((e - s) / spec["sfreq"], raw.duration - onset_time)
@@ -397,7 +402,7 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
         events = np.array(event_rows)
 
         mne_epochs = mne.Epochs(raw, events, event_id=event_id,
-            tmin=0, tmax=max_dur, baseline=None, preload=True, verbose=False)
+            tmin=0, tmax=max_dur, baseline=None, preload=True, event_repeated="merge", verbose=False)
         ann_list = [ann_list[i] for i in mne_epochs.selection]
         stc_gen = apply_inverse_epochs(mne_epochs, prepared_inv,
             lambda2=lambda2,
