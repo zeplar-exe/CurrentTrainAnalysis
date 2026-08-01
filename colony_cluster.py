@@ -132,6 +132,9 @@ for dataset, subjects in test_eeg.items():
                 print(f"        Window: {i+1}/{n_windows}")
                 start_time = i * WINDOW_LENGTH
                 end_time = start_time + WINDOW_LENGTH
+                
+                if end_time > raw_record.times[-1]:
+                    break
 
                 band_data = defaultdict(dict)
 
@@ -191,7 +194,8 @@ for dataset, subjects in test_eeg.items():
                     return overlaps, distance
                 
                 source_results = {}
-                for source_type in ["csd", "inverse"]:
+                # how do we handle different CSD electrode arrays (sizes)?
+                for source_type in ["inverse"]: #["csd", "inverse"]:
                     if source_type in band_data:
                         source_results[source_type] = get_source_overlap(source_type)
 

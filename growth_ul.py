@@ -16,7 +16,7 @@ SEED = 42
 UMAP_COMPONENTS = 100
 PCA_COMPONENTS = 1000
 TIMESTEPS = [10, 25, 50, 100, 200] # ms
-CLUSTER_WINDOWS = [1, 3, 5, 8, 15]
+CLUSTER_WINDOWS = [1, 3, 5, 8, 15] # necessary for both the paths, and for the clustering (it provides a set of growths instead of 1)
 
 keras.utils.set_random_seed(SEED) # seed for UMAP encoder
 
@@ -206,9 +206,8 @@ def generate_subject_data():
                                 poss.extend(pos_split)
                                 negs.extend(neg_split)
 
-                            if not raws:
-                                continue
-                            np.save(output_path, np.array([np.stack(raws), np.stack(poss), np.stack(negs)]))
+                            if raws:
+                                np.save(output_path, np.array([np.stack(raws), np.stack(poss), np.stack(negs)]))
 
 def generate_models(for_timestep: int, for_cluster_window: int):
     pass
