@@ -43,6 +43,7 @@ DATASET_SPECS = {
             11: "task4_imagine_both_fists",
             12: "task4_imagine_both_feet",
         },
+        "event_time_padding": None, # s
         "ignore_events": [1, 4, 7, 10]
     },
     "grasplift": {
@@ -65,6 +66,7 @@ DATASET_SPECS = {
             5: "Replace",
             6: "BothReleased",
         },
+        "event_time_padding": (-200 / 1000, 0), # s
         "ignore_events": [3, 6],
     },
 }
@@ -145,7 +147,7 @@ class Colony:
             last_matrix = current_matrix
     
     def raw_weights(self):
-        return (self.colony_raw - np.min(self.colony_raw)) / np.percentile(self.colony_raw, 99)
+        return self.colony_raw / np.percentile(self.colony_raw, 99)
     
     def abs_weights(self):
         return (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99)
@@ -154,7 +156,7 @@ class Colony:
         return (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99)
 
     def neg_weights(self):
-        return (self.colony_neg - np.min(self.colony_neg)) / np.percentile(self.colony_neg, 99)
+        return (self.colony_neg - np.max(self.colony_neg)) / -np.percentile(np.abs(self.colony_neg), 99)
 
 
 def _read_eegmmidb_record(record: Path, spec: dict):
@@ -178,7 +180,8 @@ def _read_eegmmidb_record(record: Path, spec: dict):
     duration = np.minimum((annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"], raw.duration - onset)
     description = annotation_data[:, 0].astype(int).astype(str)
 
-    raw.set_annotations(mne.Annotations(onset=onset, duration=duration, description=description))
+    padding_back, padding_forward = spec["event_time_padding"][0] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
+    raw.set_annotations(mne.Annotations(onset=onset + padding_back, duration=duration + padding_forward, description=description))
     events = np.column_stack(
         [
             annotation_data[:, 3].astype(int) - 1,
@@ -230,8 +233,13 @@ def _read_grasplift_record(record: Path, spec: dict):
             durations.append(dur)
             descriptions.append(str(code))
             event_rows.append([s, 0, code])
+        
+    onsets = np.array(onsets)
+    durations = np.array(durations)
+    descriptions = np.array(descriptions)
 
-    raw.set_annotations(mne.Annotations(onset=onsets, duration=durations, description=descriptions))
+    padding_back, padding_forward = spec["event_time_padding"][0] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
+    raw.set_annotations(mne.Annotations(onset=onsets + padding_back, duration=durations + padding_forward, description=descriptions))
     events = np.array(event_rows) if event_rows else np.empty((0, 3), dtype=int)
 
     return raw, events
@@ -462,7 +470,8 @@ if __name__ == "__main__":
                 src_data = mne.read_source_spaces(src)
                 inverse_mirror_map = build_hemisphere_mirror_map(src_data, inv['src'][0]['vertno'], inv['src'][1]['vertno'])
 
-                colonies = {}
+                reg_colonies = {}
+                mirror_colonies = {}
 
                 include_raw = False
                 include_abs = False
@@ -492,15 +501,25 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
                         raw_filtered = raw_active.copy()
                         raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
 
-                        new_colonies = compute_gain(prepared_inv, raw_filtered,
+                        new_regular_colonies = compute_gain(prepared_inv, raw_filtered,
                                                     inverse_mirror_map, lambda2, TIMESTEP,
                                                     include_vol=True, include_csd=True,
                                                     include_inverse=True,
                                                     include_raw=include_raw, include_abs=include_abs,
-                                                    include_pos=include_pos, include_neg=include_neg)
+                                                    include_pos=include_pos, include_neg=include_neg,
+                                                    mirror=False)
+                        new_mirred_colonies = compute_gain(prepared_inv, raw_filtered,
+                                                    inverse_mirror_map, lambda2, TIMESTEP,
+                                                    include_vol=True, include_csd=True,
+                                                    include_inverse=True,
+                                                    include_raw=include_raw, include_abs=include_abs,
+                                                    include_pos=include_pos, include_neg=include_neg,
+                                                    mirror=True)
 
-                        for (source, group), new_colony in new_colonies.items():
-                            colonies[(source, band_name, group)] = new_colony
+                        for (source, group), new_colony in new_regular_colonies.items():
+                            reg_colonies[(source, band_name, group)] = new_colony
+                        for (source, group), new_colony in new_mirred_colonies.items():
+                            mirror_colonies[(source, band_name, group)] = new_colony
 
                 lh_vertno = inv['src'][0]['vertno']
                 rh_vertno = inv['src'][1]['vertno']
@@ -509,8 +528,8 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 
                 all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
                 
-                def write_colony(colony, calc, source, band_name, group):
-                    target_dir = output_dir / calc / source / band_name
+                def write_colony(colony, calc, source, band_name, group, mirror_key):
+                    target_dir = output_dir / calc / source / band_name / mirror_key
                     target_dir.mkdir(parents=True, exist_ok=True)
                     with open(target_dir / f"{group}.csv", "w") as f:
                         if source == "inverse":
@@ -524,16 +543,17 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
                             for i in range(colony.shape[0]):
                                 value = colony[i]
                                 f.write(f"{raw_baseline.ch_names[i]},{value}\n")
-                    
-                for (source, band_name, group), colony in colonies.items():
-                    if include_raw:
-                        write_colony(colony.colony_raw, "raw", source, band_name, group)
-                    if include_abs:
-                        write_colony(colony.colony_abs, "abs", source, band_name, group)
-                    if include_pos:
-                        write_colony(colony.colony_pos, "pos", source, band_name, group)
-                    if include_neg:
-                        write_colony(colony.colony_neg, "neg", source, band_name, group)
+                
+                for mirror_key, colonies in {"regular": reg_colonies, "mirrored": mirror_colonies}.items():
+                    for (source, band_name, group), colony in colonies.items():
+                        if include_raw:
+                            write_colony(colony.colony_raw, "raw", source, band_name, group, mirror_key)
+                        if include_abs:
+                            write_colony(colony.colony_abs, "abs", source, band_name, group, mirror_key)
+                        if include_pos:
+                            write_colony(colony.colony_pos, "pos", source, band_name, group, mirror_key)
+                        if include_neg:
+                            write_colony(colony.colony_neg, "neg", source, band_name, group, mirror_key)
 
 # + we need to set this up as a reusable funciton that is agnostic to input stream (raw vs csd vs inverse)
 # + we need to set this up to run on all of the records and beyond
@@ -569,15 +589,17 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # + refactor _read_csv_record to be eegmmidb-specific (remove the glob in the spec and put it here)
 # + ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
 # how do we choose when to mirror and when not to mirror during colony growth?
+# + HEY HEY: what if we mapped the grasplift events to be 100ms earlier? since we're catching unwanted occipital data
+# ALSO ALSO: it would be nice to use the eye dataset after all since it's fully self contained events (blinks, saccades, fixations)
+# ALSO ALSO: we ought to update colony_path.py to use the raw data instead of the windows cause windows of growth aren't useful?? I think, but I'm tired
+    # actually yeah no shit; for the synthetic generator, we care about the scale of the deviations, not the windows of growth
 # looks like we have an unsupervised clusterer on our hands: test by collecting colony on some arbitrary event (or relaxation) 
-    # and then do a comparison with CSD & Inverse on the arbitrary epoch and the coalesced colony
-        # (we need to test all Vol/CSD/Inverse combinations) to get the match percentage/probability
-            # would also need to implement the weighting of the coalesced colony someway
-            # also: do we mirror the input epoch? I guess so; you could test with/without
-        # oh, we should do this per-band too, to see if the band has an effect on the accuracy
-    # cause: inverse handles spatial densities; CSD handles dipoles and provides another form of localization
-    # for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
-# HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
+    # + would also need to implement the weighting of the coalesced colony someway
+    # + also: do we mirror the input epoch? I guess so; you could test with/without
+    # + oh, we should do this per-band too, to see if the band has an effect on the accuracy
+    # - cause: inverse handles spatial densities; CSD handles dipoles and provides another form of localization
+    # + for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
+# + HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
 # after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
 
 # also also, we should probably do the mirroring for csd and raw too
@@ -607,7 +629,8 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
         # this does mean a baseline close to zero can cause a spike, mitigated by averaging and sample size
     # hemispheric mirroring to deal with general lateralization
         # for anything that is heavily lateralized to one side this hurts btw (aka, no generalizability here)
-    # using different bands because some events respond better on different bands (again, no generalizability)
+    # using different bands because some events respond better on different bands
+    # limitation: not dealing with different sized electrode arrays for EEG and CSD
 
 # for rigor: report skewness on our colony files
     # claude says skewness coefficient is effect size and fine on its own (since n is large)
@@ -629,3 +652,4 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # also: do you reckon we can calculate per-lobe density? for state machining (somehow)
         # alternatively, we could just kill a lobe we don't want for a certain event (ad hoc choice... should be customizable)
     # and: how do we manage lateralization? we're still flatly doing mirroring everywhere...
+    # statem achine: is it even possible to generally identify "motor cortex planning" -> detect which specific action?

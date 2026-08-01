@@ -31,20 +31,20 @@ reference_colonies = {
 }
 
 test_eeg = {
-    "eegmmidb": {
-        "S011": [0, 1, 2, 3, 4, 5],
-        "S012": [0, 1, 2, 3, 4, 5],
+    #"eegmmidb": {
+        #"S011": [0, 1, 2, 3, 4, 5],
+        #"S012": [0, 1, 2, 3, 4, 5],
         #"S013": [0, 1, 2, 3, 4, 5],
         #"S014": [0, 1, 2, 3, 4, 5],
         #"S015": [0, 1, 2, 3, 4, 5],
-    },
+    #},
     "grasplift": {
-        "subj1": [0, 1, 2, 3, 4, 5],
-        "subj2": [0, 1, 2, 3, 4, 5],
-        "subj9": [0, 1, 2, 3, 4, 5],
-        "subj10": [0, 1, 2, 3, 4, 5],
-        "subj11": [0, 1, 2, 3, 4, 5],
-        "subj12": [0, 1, 2, 3, 4, 5],
+        "subj1": [0, 1, 2, 3],
+        #"subj2": [0, 1, 2, 3, 4, 5],
+        #"subj9": [0, 1, 2, 3, 4, 5],
+        #"subj10": [0, 1, 2, 3, 4, 5],
+        #"subj11": [0, 1, 2, 3, 4, 5],
+        "subj12": [0, 1, 2, 3],
     }
 }
 
@@ -167,14 +167,16 @@ for dataset, subjects in test_eeg.items():
                                 pkey = (pstart, pend)
 
                                 pos_lo, pos_hi = np.quantile(pos_weights, pstart), np.quantile(pos_weights, pend)
-                                neg_lo, neg_hi = np.quantile(neg_weights, pstart), np.quantile(neg_weights, pend)
+                                neg_abs = np.abs(neg_weights)
+                                neg_lo, neg_hi = np.quantile(neg_abs, pstart), np.quantile(neg_abs, pend)
                                 pos_top = set(np.where((pos_weights >= pos_lo) & (pos_weights <= pos_hi))[0])
-                                neg_top = set(np.where((neg_weights >= neg_lo) & (neg_weights <= neg_hi))[0])
+                                neg_top = set(np.where((neg_abs >= neg_lo) & (neg_abs <= neg_hi))[0])
 
                                 ref_pos_lo, ref_pos_hi = np.quantile(ref_pos_weights, pstart), np.quantile(ref_pos_weights, pend)
-                                ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_weights, pstart), np.quantile(ref_neg_weights, pend)
+                                ref_neg_abs = np.abs(ref_neg_weights)
+                                ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_abs, pstart), np.quantile(ref_neg_abs, pend)
                                 ref_pos_top = set(np.where((ref_pos_weights >= ref_pos_lo) & (ref_pos_weights <= ref_pos_hi))[0])
-                                ref_neg_top = set(np.where((ref_neg_weights >= ref_neg_lo) & (ref_neg_weights <= ref_neg_hi))[0])
+                                ref_neg_top = set(np.where((ref_neg_abs >= ref_neg_lo) & (ref_neg_abs <= ref_neg_hi))[0])
 
                                 pos_union = pos_top | ref_pos_top
                                 neg_union = neg_top | ref_neg_top
@@ -184,7 +186,7 @@ for dataset, subjects in test_eeg.items():
                                 pos_sel = list(pos_top | ref_pos_top)
                                 neg_sel = list(neg_top | ref_neg_top)
                                 distance[ref]["pos"][band_name][pkey] = np.sqrt(np.sum((pos_weights[pos_sel] - ref_pos_weights[pos_sel]) ** 2)) if pos_sel else 0.0
-                                distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_weights[neg_sel] - ref_neg_weights[neg_sel]) ** 2)) if neg_sel else 0.0
+                                distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_abs[neg_sel] - ref_neg_abs[neg_sel]) ** 2)) if neg_sel else 0.0
 
                     return overlaps, distance
                 
@@ -295,13 +297,10 @@ for dataset, subjects in test_eeg.items():
 
 
 # I don't even fucking know at this point; we just gotta go for maximum power
-    # maybe the scoring needs to take all bands + CSD into account (voltage is useless, drop it)
-    # also implement the negatives as well
+    # + maybe the scoring needs to take all bands + CSD into account (voltage is useless, drop it)
+    # + also implement the negatives as well
     # also need to start exporting the things that are failing so we have an idea of what's failing and why
         # maybe have a 3D plot of what is failing based on the intersect/union
 # MAKE A SCRIPT TO GET BETWEEN-BAND AND ACROSS-BAND OVERLAP AVERAGES AND STUFF instead of just guessing
-
-# also, your fucking discriminator makes no fucking sense what are you even doing?
-    # it is 3:10am so I don't have the mental capacity to fucking dig into your asshole but just you fucking wait
     
     

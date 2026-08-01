@@ -19,7 +19,7 @@ def coalesce(paths: List[str], output_path: str):
     result.to_csv(output_path, index=False)
 
 
-def coalesce_event_band(dataset, event, band, vol=True, csd=True, inverse=True):
+def coalesce_event_band(dataset, event, band, mirrored, vol=True, csd=True, inverse=True):
     colonies_root = Path("colonies") / dataset
     output_root = Path("coalesce") / dataset
     subjects = sorted(p.name for p in colonies_root.iterdir() if p.is_dir() and not p.name.startswith("."))
@@ -30,7 +30,8 @@ def coalesce_event_band(dataset, event, band, vol=True, csd=True, inverse=True):
         for sign in ("pos", "neg"):
             paths = []
             for subject in subjects:
-                csv_path = colonies_root / subject / sign / method / band / f"{event}.csv"
+                mirror_key = "regular" if not mirrored else "mirrored"
+                csv_path = colonies_root / subject / sign / method / band / mirror_key / f"{event}.csv"
                 if csv_path.exists():
                     paths.append(str(csv_path))
 
@@ -43,14 +44,13 @@ def coalesce_event_band(dataset, event, band, vol=True, csd=True, inverse=True):
 
 
 EVENTS = [
-    "task1_real_left_fist", "task1_real_right_fist",
-    "task2_imagine_left_fist", "task2_imagine_right_fist",
-    "task3_real_both_fists", "task3_real_both_feet",
-    "task4_imagine_both_fists", "task4_imagine_both_feet",
+    "HandStart",
+    "FirstDigitTouch",
+    "LiftOff",
 ]
 BANDS = ["whole", "standard", "alpha", "beta", "delta", "theta", "gamma"]
 
 if __name__ == "__main__":
     for event in EVENTS:
         for band in BANDS:
-            coalesce_event_band("eegmmidb", event, band)
+            coalesce_event_band("eegmmidb", event, band, mirrored=False)

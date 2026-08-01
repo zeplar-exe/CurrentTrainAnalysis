@@ -8,18 +8,15 @@ import collections
 import itertools
 from pathlib import Path
 import keras
-from hmmlearn import hmm
-import torch
-from umap.parametric_umap import ParametricUMAP
-from sklearn.decomposition import IncrementalPCA
 from colony import DATASET_SPECS, BANDS, load_subject, read_subject_record, setup_inverse
 from denstream import DenStream
+from collections import defaultdict
 
 SEED = 42
 UMAP_COMPONENTS = 100
 PCA_COMPONENTS = 1000
-TIMESTEPS = [50, 100, 200] # ms
-CLUSTER_WINDOWS = [3, 5, 8, 15]
+TIMESTEPS = [10, 25, 50, 100, 200] # ms
+CLUSTER_WINDOWS = [1, 3, 5, 8, 15]
 
 keras.utils.set_random_seed(SEED) # seed for UMAP encoder
 
@@ -198,6 +195,8 @@ def generate_subject_data():
 
                                 raw_growth, pos_growth, neg_growth = collect(sample, step=int(timestep_ms * sfreq), sfreq=sfreq)
                                 n_full_windows = raw_growth.shape[1] // cluster_window
+                                if n_full_windows == 0:
+                                    continue
                                 trim = n_full_windows * cluster_window
                                 raw_split = np.split(raw_growth[:, :trim], n_full_windows, axis=1)
                                 pos_split = np.split(pos_growth[:, :trim], n_full_windows, axis=1)
@@ -207,10 +206,13 @@ def generate_subject_data():
                                 poss.extend(pos_split)
                                 negs.extend(neg_split)
 
+                            if not raws:
+                                continue
                             np.save(output_path, np.array([np.stack(raws), np.stack(poss), np.stack(negs)]))
 
 def generate_models(for_timestep: int, for_cluster_window: int):
     pass
+    # either we concede to the manifold OR we switch to a 3D fsaverage model (I vote for this one)
 
 if __name__ == "__main__":
     generate_subject_data()
@@ -220,7 +222,9 @@ if __name__ == "__main__":
 # + gotta select equidistant, all-encompassing spheres/vertex centers instead of random
 # gotta be able to visualize the clusters in their spheres (approximated? export with coordinates?)
 
-# one thing: are we ever going to take bands into account here? probably should, right?
+# + one thing: are we ever going to take bands into account here? probably should, right?
+    # shall we just combine them all into one feature set? I think so
+    # but also test per-band clustering of course
 # oh boy... how are we going to mass run all of these?
 # so, we need to have a loader to get all or some (random sample?) of the growth/ data to put into the model
 # once the model is fitted on all of that, we can then 1) check the clusters in a 3d view/animation (cause it's over time)
