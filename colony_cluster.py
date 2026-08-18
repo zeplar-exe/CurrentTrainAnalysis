@@ -5,6 +5,7 @@ mne.set_log_level("WARNING")
 from mne.minimum_norm import prepare_inverse_operator
 import pandas as pd
 from tqdm import tqdm
+from sklearn.linear_model import LogisticRegression
 from colony import Colony, build_hemisphere_mirror_map, compute_gain, load_subject, read_subject_record, setup_inverse, BANDS, DATASET_SPECS, TIMESTEP
 import numpy as np
 from collections import defaultdict
@@ -90,6 +91,7 @@ for dataset, subjects in test_eeg.items():
 
     dataset_confusion = defaultdict(int)
     subject_results = {}
+    all_subjects_band_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
     for subject, record_indices in tqdm(subjects.items(), desc="Subjects", disable=not INTERACTIVE):
         print(f"Subject: {subject}")
@@ -111,9 +113,6 @@ for dataset, subjects in test_eeg.items():
         rh_vertno = inv['src'][1]['vertno']
         inverse_mirror_map = build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno)
 
-        subject_confusion = defaultdict(int)
-        subject_entries = []
-
         for r_id in record_indices:
             print(f"    Record: {r_id}")
             raw_record, _ = read_subject_record(dataset, subject_active_files[r_id])
@@ -121,6 +120,8 @@ for dataset, subjects in test_eeg.items():
             
             filtered_records = {}
             for band_name, band in BANDS.items():
+                if band_name in ["standard", "whole"]:
+                    continue
                 print(f"    Filtering band: {band_name}")
                 low = band["low"]
                 high = min(band["high"], raw_baseline.info["sfreq"] / 2 - 1)
@@ -135,12 +136,14 @@ for dataset, subjects in test_eeg.items():
                 
                 if end_time > raw_record.times[-1]:
                     break
-
-                band_data = defaultdict(dict)
-
-                true_event = get_window_event(raw_record, start_time, end_time, spec) or "rest"
-
+                
+                true_event = get_window_event(raw_record, start_time, end_time, spec)
+                if not true_event:
+                    continue
+                
                 for band_name in BANDS:
+                    if band_name in ["standard", "whole"]:
+                        continue
                     raw_window = filtered_records[band_name].copy().crop(tmin=start_time, tmax=end_time)
 
                     colonies = compute_gain(prepared_inv, raw_window, inverse_mirror_map, lambda2, TIMESTEP,
@@ -149,91 +152,134 @@ for dataset, subjects in test_eeg.items():
                                             use_epochs=False, mirror=True)
 
                     for (source, _), colony in colonies.items():
-                        if source not in band_data:
-                            band_data[source] = {}
-                        band_data[source][band_name] = colony
-
+                        # need to make this temporal based so we can differentiate bteween different time windows
+                        # (source, subject, epoch_id) => (list_of_band_colonies, true_event)
+                        all_subjects_band_data[subject][band_name][source].append((true_event, colony))
+    
+    source_band_pos_weights = {}
+    source_band_neg_weights = {}
+    
+    for source_type, subject_band_data in all_subjects_band_data.items():
+        for band_name, colony_data in subject_band_data.items():
+            X_pos = []
+            X_neg = []
+            y = []
             
-                def get_source_overlap(source):
-                    overlaps = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
-                    distance = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
-
-                    for band_name, colony in band_data[source].items():
-                        pos_weights = colony.pos_weights()
-                        neg_weights = colony.neg_weights()
-
-                        for ref, ref_colony in ref_cache[source][band_name].items():
-                            ref_pos_weights = ref_colony.pos_weights()
-                            ref_neg_weights = ref_colony.neg_weights()
-
-                            for pstart, pend in PERCENTILES:
-                                pkey = (pstart, pend)
-
-                                pos_lo, pos_hi = np.quantile(pos_weights, pstart), np.quantile(pos_weights, pend)
-                                neg_abs = np.abs(neg_weights)
-                                neg_lo, neg_hi = np.quantile(neg_abs, pstart), np.quantile(neg_abs, pend)
-                                pos_top = set(np.where((pos_weights >= pos_lo) & (pos_weights <= pos_hi))[0])
-                                neg_top = set(np.where((neg_abs >= neg_lo) & (neg_abs <= neg_hi))[0])
-
-                                ref_pos_lo, ref_pos_hi = np.quantile(ref_pos_weights, pstart), np.quantile(ref_pos_weights, pend)
-                                ref_neg_abs = np.abs(ref_neg_weights)
-                                ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_abs, pstart), np.quantile(ref_neg_abs, pend)
-                                ref_pos_top = set(np.where((ref_pos_weights >= ref_pos_lo) & (ref_pos_weights <= ref_pos_hi))[0])
-                                ref_neg_top = set(np.where((ref_neg_abs >= ref_neg_lo) & (ref_neg_abs <= ref_neg_hi))[0])
-
-                                pos_union = pos_top | ref_pos_top
-                                neg_union = neg_top | ref_neg_top
-                                overlaps[ref]["pos"][band_name][pkey] = len(pos_top & ref_pos_top) / len(pos_union) if pos_union else 0.0
-                                overlaps[ref]["neg"][band_name][pkey] = len(neg_top & ref_neg_top) / len(neg_union) if neg_union else 0.0
-
-                                pos_sel = list(pos_top | ref_pos_top)
-                                neg_sel = list(neg_top | ref_neg_top)
-                                distance[ref]["pos"][band_name][pkey] = np.sqrt(np.sum((pos_weights[pos_sel] - ref_pos_weights[pos_sel]) ** 2)) if pos_sel else 0.0
-                                distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_abs[neg_sel] - ref_neg_abs[neg_sel]) ** 2)) if neg_sel else 0.0
-
-                    return overlaps, distance
+            for _, entries in colony_data.items():
+                for true_event, colony in entries:
+                    pos_weights = colony.pos_weights()
+                    neg_weights = colony.neg_weights()
+                    X_pos.append(pos_weights)
+                    X_neg.append(neg_weights)
+                    y.append(true_event)
                 
-                source_results = {}
-                # how do we handle different CSD electrode arrays (sizes)?
-                for source_type in ["inverse"]: #["csd", "inverse"]:
-                    if source_type in band_data:
-                        source_results[source_type] = get_source_overlap(source_type)
+            clf = LogisticRegression()
+            clf.fit(X_pos, y)
+            pos_weights = np.abs(clf.coef_)
+            
+            for event_idx, event_name in enumerate(clf.classes_):
+                source_band_pos_weights[(source_type, event_name, band_name)] = pos_weights[event_idx]
 
-                best_score = -1
-                best_ref = None
+            clf.fit(X_neg, y)
+            neg_weights = np.abs(clf.coef_)
+            
+            for event_idx, event_name in enumerate(clf.classes_):
+                source_band_neg_weights[(source_type, event_name, band_name)] = neg_weights[event_idx]
+                
+    for subject in subjects.keys():
+        subject_confusion = defaultdict(int)
+        subject_entries = []
+                        
+        def predict(source, band_colonies):
+            overlaps = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
+            distance = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
 
-                for ref in all_refs:
-                    score = 0.0
-                    for source_type, (overlaps, _) in source_results.items():
-                        for sign in ["pos", "neg"]:
-                            for band_vals in overlaps[ref][sign].values():
-                                for pkey in PERCENTILES:
-                                    score += band_vals[pkey]
+            for band_name, colony in band_colonies.items():
+                if band_name in ["standard", "whole"]:
+                    continue
+                    
+                pos_weights = colony.pos_weights()
+                neg_weights = colony.neg_weights()
 
-                    if score > best_score:
-                        best_score = score
-                        best_ref = ref
+                for ref, ref_colony in ref_cache[source][band_name].items():
+                    ref_pos_weights = ref_colony.pos_weights()
+                    ref_neg_weights = ref_colony.neg_weights()
 
-                pct_metrics = {}
-                for pkey in PERCENTILES:
-                    pct_overlap = 0.0
-                    pct_distance = 0.0
-                    for source_type, (overlaps, distances) in source_results.items():
-                        for sign in ["pos", "neg"]:
-                            band_overlaps = [overlaps[best_ref][sign][bn][pkey] for bn in overlaps[best_ref][sign]]
-                            band_dists = [distances[best_ref][sign][bn][pkey] for bn in distances[best_ref][sign]]
-                            pct_overlap += np.mean(band_overlaps) if band_overlaps else 0.0
-                            pct_distance += sum(band_dists)
-                    pct_metrics[pkey] = {"overlap": pct_overlap, "distance": pct_distance}
+                    for pstart, pend in PERCENTILES:
+                        pkey = (pstart, pend)
 
-                subject_confusion[(true_event, best_ref)] += 1
-                dataset_confusion[(true_event, best_ref)] += 1
-                subject_entries.append({
-                    "true": true_event,
-                    "predicted": best_ref,
-                    "correct": true_event == best_ref,
-                    "percentiles": pct_metrics,
-                })
+                        pos_lo, pos_hi = np.quantile(pos_weights, pstart), np.quantile(pos_weights, pend)
+                        neg_abs = np.abs(neg_weights)
+                        neg_lo, neg_hi = np.quantile(neg_abs, pstart), np.quantile(neg_abs, pend)
+                        pos_top = set(np.where((pos_weights >= pos_lo) & (pos_weights <= pos_hi))[0])
+                        neg_top = set(np.where((neg_abs >= neg_lo) & (neg_abs <= neg_hi))[0])
+
+                        ref_pos_lo, ref_pos_hi = np.quantile(ref_pos_weights, pstart), np.quantile(ref_pos_weights, pend)
+                        ref_neg_abs = np.abs(ref_neg_weights)
+                        ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_abs, pstart), np.quantile(ref_neg_abs, pend)
+                        ref_pos_top = set(np.where((ref_pos_weights >= ref_pos_lo) & (ref_pos_weights <= ref_pos_hi))[0])
+                        ref_neg_top = set(np.where((ref_neg_abs >= ref_neg_lo) & (ref_neg_abs <= ref_neg_hi))[0])
+
+                        pos_union = pos_top | ref_pos_top
+                        neg_union = neg_top | ref_neg_top
+                        overlaps[ref]["pos"][band_name][pkey] = len(pos_top & ref_pos_top) / len(pos_union) if pos_union else 0.0
+                        overlaps[ref]["neg"][band_name][pkey] = len(neg_top & ref_neg_top) / len(neg_union) if neg_union else 0.0
+
+                        pos_sel = list(pos_top | ref_pos_top)
+                        neg_sel = list(neg_top | ref_neg_top)
+                        distance[ref]["pos"][band_name][pkey] = np.sqrt(np.sum((pos_weights[pos_sel] - ref_pos_weights[pos_sel]) ** 2)) if pos_sel else 0.0
+                        distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_abs[neg_sel] - ref_neg_abs[neg_sel]) ** 2)) if neg_sel else 0.0
+
+            return overlaps, distance
+        
+        source_results = {}
+        # how do we handle different CSD electrode arrays (sizes)?
+        for source_type in ["inverse"]: #["csd", "inverse"]:
+            band_c = {}
+            t = None
+            for band in BANDS:
+                if band in ["standard", "whole"]:
+                    continue
+                for true_event, colony in all_subjects_band_data[source_type][band][subject]:
+                    t = true_event
+                    band_c[band] = colony
+            source_results[source_type] = (predict(source_type, band_c), t)
+
+        best_score = -1
+        best_ref = None
+
+        for ref in all_refs:
+            score = 0.0
+            for source_type, (overlaps, _) in source_results.items():
+                for sign in ["pos", "neg"]:
+                    for band_vals in overlaps[ref][sign].values():
+                        for pkey in PERCENTILES:
+                            score += band_vals[pkey]
+
+            if score > best_score:
+                best_score = score
+                best_ref = ref
+
+        pct_metrics = {}
+        for pkey in PERCENTILES:
+            pct_overlap = 0.0
+            pct_distance = 0.0
+            for source_type, (overlaps, distances) in source_results.items():
+                for sign in ["pos", "neg"]:
+                    band_overlaps = [overlaps[best_ref][sign][bn][pkey] for bn in overlaps[best_ref][sign]]
+                    band_dists = [distances[best_ref][sign][bn][pkey] for bn in distances[best_ref][sign]]
+                    pct_overlap += np.mean(band_overlaps) if band_overlaps else 0.0
+                    pct_distance += sum(band_dists)
+            pct_metrics[pkey] = {"overlap": pct_overlap, "distance": pct_distance}
+
+        subject_confusion[(true_event, best_ref)] += 1
+        dataset_confusion[(true_event, best_ref)] += 1
+        subject_entries.append({
+            "true": true_event,
+            "predicted": best_ref,
+            "correct": true_event == best_ref,
+            "percentiles": pct_metrics,
+        })
 
         subject_results[subject] = subject_entries
 
@@ -305,6 +351,3 @@ for dataset, subjects in test_eeg.items():
     # + also implement the negatives as well
     # also need to start exporting the things that are failing so we have an idea of what's failing and why
         # maybe have a 3D plot of what is failing based on the intersect/union
-# MAKE A SCRIPT TO GET BETWEEN-BAND AND ACROSS-BAND OVERLAP AVERAGES AND STUFF instead of just guessing
-    
-    

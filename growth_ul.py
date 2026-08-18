@@ -18,6 +18,9 @@ PCA_COMPONENTS = 1000
 TIMESTEPS = [10, 25, 50, 100, 200] # ms
 CLUSTER_WINDOWS = [1, 3, 5, 8, 15] # necessary for both the paths, and for the clustering (it provides a set of growths instead of 1)
 
+TIMESTEMPS = [10, 25, 50]
+CLUSTER_WINDOWS = [5, 15]
+
 keras.utils.set_random_seed(SEED) # seed for UMAP encoder
 
 def collect(data: np.ndarray, step: int, sfreq: int):
@@ -211,7 +214,17 @@ def generate_subject_data():
 
 def generate_models(for_timestep: int, for_cluster_window: int):
     pass
-    # either we concede to the manifold OR we switch to a 3D fsaverage model (I vote for this one)
+    # also, we are gonna have to now use spheres but rather sheets of sources
+    # also this is freakish;y trivial, just need a away to select the growth/ files to use
+    # but how do we visalize the clusters?
+    # and perhaps just note: test out the full volume conduction model later on 
+    #  Literally just activations, as 
+    #   measured with growth (part 1 and not 2 of the colonies). 
+    #   And deactivation/desynchronization of course. Point is, I 
+    #   don't see why 1) clustering those activation patterns across 
+    #   subjects, 2) clustering the subjects across activation patterns 
+    #   (per-subject sterotypes), and 3) building state machines off of 
+    #   those sterotypes isn't as grounded as it can get.
 
 if __name__ == "__main__":
     generate_subject_data()

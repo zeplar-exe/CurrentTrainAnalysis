@@ -53,4 +53,4 @@ BANDS = ["whole", "standard", "alpha", "beta", "delta", "theta", "gamma"]
 if __name__ == "__main__":
     for event in EVENTS:
         for band in BANDS:
-            coalesce_event_band("eegmmidb", event, band, mirrored=False)
+            coalesce_event_band("grasplift", event, band, mirrored=False)

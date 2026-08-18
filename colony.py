@@ -66,7 +66,7 @@ DATASET_SPECS = {
             5: "Replace",
             6: "BothReleased",
         },
-        "event_time_padding": (-200 / 1000, 0), # s
+        "event_time_padding": (-100 / 1000, -100 / 1000), # s
         "ignore_events": [3, 6],
     },
 }
@@ -180,7 +180,7 @@ def _read_eegmmidb_record(record: Path, spec: dict):
     duration = np.minimum((annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"], raw.duration - onset)
     description = annotation_data[:, 0].astype(int).astype(str)
 
-    padding_back, padding_forward = spec["event_time_padding"][0] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
+    padding_back, padding_forward = spec["event_time_padding"] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
     raw.set_annotations(mne.Annotations(onset=onset + padding_back, duration=duration + padding_forward, description=description))
     events = np.column_stack(
         [
@@ -238,7 +238,7 @@ def _read_grasplift_record(record: Path, spec: dict):
     durations = np.array(durations)
     descriptions = np.array(descriptions)
 
-    padding_back, padding_forward = spec["event_time_padding"][0] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
+    padding_back, padding_forward = spec["event_time_padding"] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
     raw.set_annotations(mne.Annotations(onset=onsets + padding_back, duration=durations + padding_forward, description=descriptions))
     events = np.array(event_rows) if event_rows else np.empty((0, 3), dtype=int)
 
