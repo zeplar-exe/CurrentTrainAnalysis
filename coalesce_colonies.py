@@ -7,12 +7,13 @@ from typing import List
 def coalesce(paths: List[str], output_path: str):
     dfs = [pd.read_csv(p) for p in paths]
     keys = dfs[0].columns
+    key_cols = [c for c in keys if c in ("x", "y", "z", "electrode")]
+    value_cols = [c for c in keys if c not in key_cols]
+    
     for i, df in enumerate(dfs[1:], 1):
         if not keys.equals(df.columns):
             raise ValueError(f"Column mismatch: {paths[0]} has {list(keys)}, {paths[i]} has {list(df.columns)}")
-
-    key_cols = [c for c in keys if c in ("x", "y", "z", "electrode")]
-    value_cols = [c for c in keys if c not in key_cols]
+        df[value_cols] = (df[value_cols] / df[value_cols].quantile(0.99)).clip(upper=1.0)
 
     combined = pd.concat(dfs, ignore_index=True)
     result = combined.groupby(key_cols, as_index=False)[value_cols].sum()

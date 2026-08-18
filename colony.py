@@ -147,16 +147,16 @@ class Colony:
             last_matrix = current_matrix
     
     def raw_weights(self):
-        return self.colony_raw / np.percentile(self.colony_raw, 99)
+        return min(1, self.colony_raw / np.percentile(self.colony_raw, 99))
     
     def abs_weights(self):
-        return (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99)
+        return min(1, (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99))
     
     def pos_weights(self):
-        return (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99)
+        return min(1, (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99))
 
     def neg_weights(self):
-        return (self.colony_neg - np.max(self.colony_neg)) / -np.percentile(np.abs(self.colony_neg), 99)
+        return min(1, (self.colony_neg - np.max(self.colony_neg)) / -np.percentile(np.abs(self.colony_neg), 99))
 
 
 def _read_eegmmidb_record(record: Path, spec: dict):
