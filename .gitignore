@@ -12,3 +12,5 @@ datasets
 coalesce
 inverse
 .DS_Store
+pnpl/
+*.html

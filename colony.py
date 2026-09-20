@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from mne.minimum_norm import prepare_inverse_operator, apply_inverse_raw, apply_inverse_epochs, write_inverse_operator, read_inverse_operator, make_inverse_operator
 import mne
 from mne.minimum_norm import InverseOperator
@@ -10,120 +12,36 @@ from pathlib import Path
 from rich.live import Live
 from rich.panel import Panel
 from typing import Literal
+from core import DATASET_SPECS, BANDS, get_dataset_spec
 
 warnings.filterwarnings("ignore", message="FastICA did not converge")
 warnings.filterwarnings("ignore", message=".*does not conform to MNE naming conventions.*")
 
-Source = Literal["vol", "csd", "inverse"]
-ColonyMap = dict[tuple[Source, str], "Colony"]
-
-DATASET_SPECS = {
-    "eegmmidb": {
-        "root": Path("./datasets/eegmmidb"),
-        "sfreq": 160.0,
-        "subjects": [f"S{i:03d}" for i in range(1, 103 + 1)],
-        "channels": [
-            "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
-            "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "Fp1", "Fpz", "Fp2", "AF7", "AF3", "AFz",
-            "AF4", "AF8", "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8", "FT7", "FT8", "T7",
-            "T8", "T9", "T10", "TP7", "TP8", "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
-            "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2", "Iz",
-        ],
-        "event_ids": {
-            1: "task1_relax",
-            2: "task1_real_left_fist",
-            3: "task1_real_right_fist",
-            4: "task2_relax",
-            5: "task2_imagine_left_fist",
-            6: "task2_imagine_right_fist",
-            7: "task3_relax",
-            8: "task3_real_both_fists",
-            9: "task3_real_both_feet",
-            10: "task4_relax",
-            11: "task4_imagine_both_fists",
-            12: "task4_imagine_both_feet",
-        },
-        "event_time_padding": None, # s
-        "ignore_events": [1, 4, 7, 10]
-    },
-    "grasplift": {
-        "root": Path("./datasets/grasplift/train"),
-        "sfreq": 500.0,
-        "subjects": [f"subj{i}" for i in range(1, 12 + 1)],
-        "channels": [
-            "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
-            "FC5", "FC1", "FC2", "FC6",
-            "T7", "C3", "Cz", "C4", "T8",
-            "TP9", "CP5", "CP1", "CP2", "CP6", "TP10",
-            "P7", "P3", "Pz", "P4", "P8",
-            "PO9", "O1", "Oz", "O2", "PO10",
-        ],
-        "event_ids": {
-            1: "HandStart",
-            2: "FirstDigitTouch",
-            3: "BothStartLoadPhase",
-            4: "LiftOff",
-            5: "Replace",
-            6: "BothReleased",
-        },
-        "event_time_padding": (-100 / 1000, -100 / 1000), # s
-        "ignore_events": [3, 6],
-    },
-}
+ColonySource = Literal["vol", "csd", "inverse"]
+ColonyType = Literal["raw", "abs", "pos", "neg"]
+ColonyMap = dict[tuple[ColonySource, str], "MultiColony"]
 
 TIMESTEP = 50 / 1000 # s
-
-BANDS = {
-    "whole": {
-        "low": 1,
-        "high": 100,
-    },
-    "standard": {
-        "low": 1,
-        "high": 30
-    },
-    "theta": {
-        "low": 1,
-        "high": 4,
-    }, 
-    "delta": {
-        "low": 4,
-        "high": 8,
-    },
-    "alpha": {
-        "low": 8,
-        "high": 13,
-    },
-    "beta": {
-        "low": 13,
-        "high": 30,
-    },
-    "gamma": {
-        "low": 30,
-        "high": 100,
-    },
-}
-
-
-def get_dataset_spec(dataset: str):
-    try:
-        return DATASET_SPECS[dataset]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported dataset: {dataset}") from exc
+MULTICOLONY_STEP = 150 / 1000 # s
 
 
 class Colony:
     DEVIATION_RESOLUTION = 2.0 # s
     
     def __init__(self, size: int, include_raw: bool = False, include_abs: bool = False, include_pos: bool = False, include_neg: bool = False):
+        self.size = size
         self.include_raw = include_raw
         self.include_abs = include_abs
         self.include_pos = include_pos
         self.include_neg = include_neg
-        self.colony_raw = np.zeros(size)
-        self.colony_abs = np.zeros(size)
-        self.colony_pos = np.zeros(size)
-        self.colony_neg = np.zeros(size)
+        if include_raw:
+            self.colony_raw = np.zeros(size)
+        if include_abs:
+            self.colony_abs = np.zeros(size)
+        if include_pos: 
+            self.colony_pos = np.zeros(size)
+        if include_neg:
+            self.colony_neg = np.zeros(size)
         
     def feed(self, data: np.ndarray, step: int, sfreq: int, deviation=True):
         if deviation:
@@ -147,50 +65,67 @@ class Colony:
             last_matrix = current_matrix
     
     def raw_weights(self):
-        return min(1, self.colony_raw / np.percentile(self.colony_raw, 99))
+        return np.minimum(1, self.colony_raw / np.percentile(self.colony_raw, 99))
     
     def abs_weights(self):
-        return min(1, (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99))
+        return np.minimum(1, (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99))
     
     def pos_weights(self):
-        return min(1, (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99))
+        return np.minimum(1, (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99))
 
     def neg_weights(self):
-        return min(1, (self.colony_neg - np.max(self.colony_neg)) / -np.percentile(np.abs(self.colony_neg), 99))
+        return np.minimum(1, (self.colony_neg - np.max(self.colony_neg)) / -np.percentile(np.abs(self.colony_neg), 99))
+    
+    def merge(self, other: "Colony"):
+        if self.size != other.size:
+            raise ValueError(f"Cannot merge Colonies with different sizes: {self.size} vs {other.size}")
+        
+        if self.include_raw and other.include_raw:
+            self.colony_raw += other.colony_raw
+        if self.include_abs and other.include_abs:
+            self.colony_abs += other.colony_abs
+        if self.include_pos and other.include_pos:
+            self.colony_pos += other.colony_pos
+        if self.include_neg and other.include_neg:
+            self.colony_neg += other.colony_neg
 
 
-def _read_eegmmidb_record(record: Path, spec: dict):
-    signal_path = Path(record)
-    annotation_path = signal_path.with_name(signal_path.name.replace("_SIG_", "_ANN_"))
+class MultiColony:
+    def __init__(self, colonies: list[Colony], size: int, interval: float):
+        for colony in colonies:
+            if colony.size != size:
+                raise ValueError(f"Cannot create MultiColony with Colonies of different sizes: {size} vs {colony.size}")
+        
+        self.colonies = colonies
+        self.size = size
+        self.interval = interval
+    
+    def raw_weights(self):
+        return np.array([colony.raw_weights() for colony in self.colonies])
+    
+    def abs_weights(self):
+        return np.array([colony.abs_weights() for colony in self.colonies])
+    
+    def pos_weights(self):
+        return np.array([colony.pos_weights() for colony in self.colonies])
 
-    signal = np.atleast_2d(np.loadtxt(signal_path, delimiter=",", dtype=float))
-    if signal.shape[1] != len(spec["channels"]):
-        raise ValueError(
-            f"Unexpected channel count in {signal_path}: expected {len(spec['channels'])}, got {signal.shape[1]}"
-        )
+    def neg_weights(self):
+        return np.array([colony.neg_weights() for colony in self.colonies])
+    
+    def merge(self, other: "MultiColony"):
+        if self.interval != other.interval:
+            raise ValueError(f"Cannot merge MultiColonies with different intervals: {self.interval} vs {other.interval}")
+        if self.size != other.size:
+            raise ValueError(f"Cannot merge MultiColonies with different sizes: {self.size} vs {other.size}")
+        
+        diff = len(other.colonies) - len(self.colonies)
+        if diff > 0:
+            self.colonies.extend([Colony(self.size, include_raw=True, include_abs=True, include_pos=True, include_neg=True) for _ in range(diff)])
+        for i, colony in enumerate(other.colonies):
+            if colony.size != self.size:
+                raise ValueError(f"Cannot merge Colonies with different sizes: {self.size} vs {colony.size}")
+            self.colonies[i].merge(colony)
 
-    raw = mne.io.RawArray(signal.T * 1e-6, mne.create_info(spec["channels"], spec["sfreq"], ch_types="eeg"), verbose="error")
-    raw.set_montage("standard_1005")
-    raw.set_eeg_reference(projection=True)
-
-    annotation_data = np.atleast_2d(np.loadtxt(annotation_path, delimiter=",", dtype=float))
-    annotation_data = annotation_data[~np.isin(annotation_data[:, 0], spec.get("ignore_events", [])), :]
-    onset = (annotation_data[:, 3] - 1) / spec["sfreq"]
-    # mne complains about annotation durations
-    duration = np.minimum((annotation_data[:, 4] - annotation_data[:, 3] + 1) / spec["sfreq"], raw.duration - onset)
-    description = annotation_data[:, 0].astype(int).astype(str)
-
-    padding_back, padding_forward = spec["event_time_padding"] if isinstance(spec["event_time_padding"], tuple) else (0, 0)
-    raw.set_annotations(mne.Annotations(onset=onset + padding_back, duration=duration + padding_forward, description=description))
-    events = np.column_stack(
-        [
-            annotation_data[:, 3].astype(int) - 1,
-            np.zeros(len(annotation_data), dtype=int),
-            annotation_data[:, 0].astype(int),
-        ]
-    )
-
-    return raw, events
 
 def _read_grasplift_record(record: Path, spec: dict):
     signal_path = Path(record)
@@ -247,13 +182,6 @@ def _read_grasplift_record(record: Path, spec: dict):
 def load_subject(dataset, subject):
     spec = get_dataset_spec(dataset)
 
-    if dataset == "eegmmidb":
-        subject_id = subject[1:] if subject.startswith("S") else subject
-        runs = sorted(spec["root"].glob(f"SUB_{subject_id}_SIG_*.csv"))
-        if not runs:
-            raise ValueError(f"Subject {subject} not found in dataset {dataset}")
-        return runs[0], runs[2:]
-
     if dataset == "grasplift":
         series = sorted(spec["root"].glob(f"{subject}_series*_data.csv"),
                         key=lambda p: int(p.stem.split("_series")[1].split("_")[0]))
@@ -277,9 +205,7 @@ def fix_raw(dataset, raw):
 def read_subject_record(dataset, record):
     spec = get_dataset_spec(dataset)
 
-    if dataset == "eegmmidb":
-        raw, events = _read_eegmmidb_record(record, spec)
-    elif dataset == "grasplift":
+    if dataset == "grasplift":
         raw, events = _read_grasplift_record(record, spec)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
@@ -321,6 +247,7 @@ def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False):
     src = fs_dir / "bem" / "fsaverage-ico-5-src.fif"
     bem = fs_dir / "bem" / "fsaverage-5120-5120-5120-bem-sol.fif"
     
+    print(save_file.absolute())
     if save_file.exists():
         return read_inverse_operator(save_file.absolute()), src, bem
 
@@ -344,12 +271,16 @@ def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False):
     return inverse_operator, src, bem 
 
 def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArray,
-                 inverse_mirror_map: NDArray[np.intp], lambda2: float, timestep: float,
+                 lambda2: float, timestep: float, colony_step: float, inverse_mirror_map: NDArray[np.intp] | None = None,
                  include_vol: bool = False, include_csd: bool = False, include_inverse: bool = False,
                  include_raw: bool = False, include_abs: bool = False,
                  include_pos: bool = False, include_neg: bool = False,
-                 use_epochs: bool = True, mirror=True) -> ColonyMap:
-    colonies: ColonyMap = {}
+                 use_epochs: bool = True) -> ColonyMap:
+    if abs((colony_step / timestep) - round(colony_step / timestep)) < 1e-6:
+        raise ValueError(f"Colony step ({colony_step}) must be a multiple of timestep ({timestep})")
+    
+    multis: ColonyMap = {}
+    colonies: dict[tuple[ColonySource, str], list[Colony]] = defaultdict(list)
     sfreq = raw.info["sfreq"]
 
     grouped_annotations: dict[str, list[tuple[float, float]]] = {}
@@ -360,7 +291,9 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
             if group not in grouped_annotations:
                 grouped_annotations[group] = []
             grouped_annotations[group].append((annotation["onset"].item(), annotation["onset"].item() + annotation["duration"].item()))
-
+    else:
+        grouped_annotations[""] = [(0, raw.times[-1])]
+    
     event_id = {name: i + 1 for i, name in enumerate(grouped_annotations)}
 
     csd_data = mne.preprocessing.compute_current_source_density(raw.copy()).get_data()
@@ -372,29 +305,25 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
     if include_csd:
         ds.append(("csd", csd_data))
     for source, data in ds:
-        if use_epochs:
-            for group, anns in grouped_annotations.items():
-                if (source, group) not in colonies:
-                    colonies[(source, group)] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+        for group, anns in grouped_annotations.items():
+            cs = colonies[(source, group)]
 
-                colony = colonies[(source, group)]
-
-                for start_time, end_time in anns:
-                    sample = data[:, int(start_time * sfreq):int(end_time * sfreq)]
-
+            for start_time, end_time in anns:
+                dur = end_time - start_time
+                t = 0
+                while t < dur:
+                    t0 = t
+                    t += colony_step
+                    sample = data[:, int((start_time + t0) * sfreq):int(min(end_time, start_time + t) * sfreq)]
+                
                     if sample.shape[1] < timestep * sfreq:
-                        continue
-
+                        sample = np.pad(sample, ((0, 0), (0, timestep * sfreq - sample.shape[1])))
+                    
+                    colony = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
                     colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
-        else:
-            if data.shape[1] >= timestep * sfreq:
-                colonies[(source, "")] = Colony(data.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
-                colonies[(source, "")].feed(data, step=int(timestep * sfreq), sfreq=sfreq)
-
-    if not include_inverse:
-        return colonies
-
-    if use_epochs:
+                    cs.append(colony)
+ 
+    if include_inverse:
         max_dur = max(et - st for anns in grouped_annotations.values() for st, et in anns)
         ann_list = []
         event_rows = []
@@ -421,40 +350,36 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
             actual_samples = min(int(dur * sfreq), stc.data.shape[1])
             sample = stc.data[:, :actual_samples]
 
-            if sample.shape[1] < timestep * sfreq:
-                continue
+            cs = colonies[("inverse", group)]
+            
+            for start_time, end_time in ann_list:
+                t = 0
+                while t < dur:
+                    t0 = t
+                    t += colony_step
+                    sample = sample[:, int((start_time + t0) * sfreq):int(min(end_time * sfreq, (start_time + t) * sfreq))]
+                
+                    if sample.shape[1] < timestep * sfreq:
+                        sample = np.pad(sample, ((0, 0), (0, timestep * sfreq - sample.shape[1])))
+                    
+                    colony = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                    colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
+                    cs.append(colony)
 
-            if ("inverse", group) not in colonies:
-                colonies[("inverse", group)] = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+    for (source, group), colony_list in colonies:
+        multis[(source, group)] = MultiColony(colonies[(source, group)], size=colony_list[0].size, interval=colony_step)
 
-            colony = colonies[("inverse", group)]
-
-            colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
-            if mirror:
-                colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
-    else:
-        stc = apply_inverse_raw(raw, prepared_inv, lambda2=lambda2,
-            method="dSPM", prepared=True)
-        sample = stc.data
-
-        if sample.shape[1] >= timestep * sfreq:
-            colonies[("inverse", "")] = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
-            colony = colonies[("inverse", "")]
-            colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
-            colony.feed(sample[inverse_mirror_map, :], step=int(timestep * sfreq), sfreq=sfreq)
-
-    return colonies
+    return multis
 
 if __name__ == "__main__":
     with Live(Panel("Initializing...", expand=False), auto_refresh=True) as live:
         target_datasets = ["grasplift"]
         for dataset_index, dataset in enumerate(target_datasets):
             spec = get_dataset_spec(dataset)
-            target_subjects = spec["subjects"][:6]
+            target_subjects = spec["subjects"][:3]
             for subject_index, subject in enumerate(target_subjects):
                 subject_baseline_file, subject_active_files = load_subject(dataset, subject)
                 raw_baseline, events_baseline = read_subject_record(dataset, subject_baseline_file)
-                
                 output_dir = Path("./colonies") / dataset / subject
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
@@ -470,8 +395,8 @@ if __name__ == "__main__":
                 src_data = mne.read_source_spaces(src)
                 inverse_mirror_map = build_hemisphere_mirror_map(src_data, inv['src'][0]['vertno'], inv['src'][1]['vertno'])
 
-                reg_colonies = {}
-                mirror_colonies = {}
+                reg_colonies: dict[tuple, MultiColony] = {}
+                mirror_colonies: dict[tuple, MultiColony] = {}
 
                 include_raw = False
                 include_abs = False
@@ -500,26 +425,30 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 
                         raw_filtered = raw_active.copy()
                         raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4)
-
+                        
                         new_regular_colonies = compute_gain(prepared_inv, raw_filtered,
-                                                    inverse_mirror_map, lambda2, TIMESTEP,
-                                                    include_vol=True, include_csd=True,
-                                                    include_inverse=True,
+                                                    lambda2, TIMESTEP, MULTICOLONY_STEP, None,
+                                                    include_vol=True, include_csd=True, include_inverse=True,
                                                     include_raw=include_raw, include_abs=include_abs,
-                                                    include_pos=include_pos, include_neg=include_neg,
-                                                    mirror=False)
+                                                    include_pos=include_pos, include_neg=include_neg)
                         new_mirred_colonies = compute_gain(prepared_inv, raw_filtered,
-                                                    inverse_mirror_map, lambda2, TIMESTEP,
-                                                    include_vol=True, include_csd=True,
-                                                    include_inverse=True,
+                                                    lambda2, TIMESTEP, MULTICOLONY_STEP, inverse_mirror_map,
+                                                    include_vol=True, include_csd=True, include_inverse=True,
                                                     include_raw=include_raw, include_abs=include_abs,
-                                                    include_pos=include_pos, include_neg=include_neg,
-                                                    mirror=True)
+                                                    include_pos=include_pos, include_neg=include_neg)
 
                         for (source, group), new_colony in new_regular_colonies.items():
-                            reg_colonies[(source, band_name, group)] = new_colony
+                            k = (source, band_name, group)
+                            if k in reg_colonies:
+                                reg_colonies[k].merge(new_colony)
+                            else:
+                                reg_colonies[k] = new_colony
                         for (source, group), new_colony in new_mirred_colonies.items():
-                            mirror_colonies[(source, band_name, group)] = new_colony
+                            k = (source, band_name, group)
+                            if k in mirror_colonies:
+                                mirror_colonies[k].merge(new_colony)
+                            else:
+                                mirror_colonies[k] = new_colony
 
                 lh_vertno = inv['src'][0]['vertno']
                 rh_vertno = inv['src'][1]['vertno']
@@ -528,32 +457,49 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 
                 all_xyz_coordinates = np.vstack([lh_coordinates, rh_coordinates])
                 
-                def write_colony(colony, calc, source, band_name, group, mirror_key):
+                def write_colony(colony: MultiColony, calc, source, band_name, group, mirror_key):
+                    if len(colony.colonies) == 0:
+                        return
+                    
                     target_dir = output_dir / calc / source / band_name / mirror_key
                     target_dir.mkdir(parents=True, exist_ok=True)
+                    relevant_arrs = []
+                    
+                    for colony_instance in colony.colonies:
+                        if calc == "raw":
+                            relevant_arrs.append(colony_instance.colony_raw)
+                        elif calc == "abs":
+                            relevant_arrs.append(colony_instance.colony_abs)
+                        elif calc == "pos":
+                            relevant_arrs.append(colony_instance.colony_pos)
+                        elif calc == "neg":
+                            relevant_arrs.append(colony_instance.colony_neg)
+                    
+                    vals = [f"value{i}" for i in range(len(relevant_arrs))]
+                    
                     with open(target_dir / f"{group}.csv", "w") as f:
                         if source == "inverse":
-                                f.write("x,y,z,value\n")
-                                for i in range(len(all_xyz_coordinates)):
-                                    x, y, z = all_xyz_coordinates[i]
-                                    value = colony[i]
-                                    f.write(f"{x},{y},{z},{value}\n")
+                            f.write(f"x,y,z,{",".join(vals)}\n")
+                            for i in range(len(all_xyz_coordinates)):
+                                x, y, z = all_xyz_coordinates[i]
+                                values = [str(a[i]) for a in relevant_arrs]
+                                f.write(f"{x},{y},{z},{','.join(values)}\n")
                         else:
                             f.write("electrode,value\n")
-                            for i in range(colony.shape[0]):
-                                value = colony[i]
-                                f.write(f"{raw_baseline.ch_names[i]},{value}\n")
+                            for i in range(relevant_arrs[0].shape[0]):
+                                value = [str(a[i]) for a in relevant_arrs]
+                                f.write(f"{raw_baseline.ch_names[i]},{','.join(value)}\n")
                 
                 for mirror_key, colonies in {"regular": reg_colonies, "mirrored": mirror_colonies}.items():
                     for (source, band_name, group), colony in colonies.items():
                         if include_raw:
-                            write_colony(colony.colony_raw, "raw", source, band_name, group, mirror_key)
+                            write_colony(colony, "raw", source, band_name, group, mirror_key)
                         if include_abs:
-                            write_colony(colony.colony_abs, "abs", source, band_name, group, mirror_key)
+                            write_colony(colony, "abs", source, band_name, group, mirror_key)
                         if include_pos:
-                            write_colony(colony.colony_pos, "pos", source, band_name, group, mirror_key)
+                            write_colony(colony, "pos", source, band_name, group, mirror_key)
                         if include_neg:
-                            write_colony(colony.colony_neg, "neg", source, band_name, group, mirror_key)
+                            write_colony(colony, "neg", source, band_name, group, mirror_key)
 
 # + we need to set this up as a reusable funciton that is agnostic to input stream (raw vs csd vs inverse)
 # + we need to set this up to run on all of the records and beyond

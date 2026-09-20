@@ -13,16 +13,6 @@ from collections import defaultdict
 INTERACTIVE = sys.stderr.isatty()
 
 reference_colonies = {
-    #"eegmmidb": [
-    #    "task1_real_left_fist",
-    #    "task1_real_right_fist",
-    #    "task2_imagine_left_fist",
-    #    "task2_imagine_right_fist",
-    #    "task3_real_both_feet",
-    #    "task3_real_both_fists",
-    #    "task4_imagine_both_feet",
-    #    "task4_imagine_both_fists"
-    #],
     "grasplift": [
         "HandStart",
         "FirstDigitTouch",
@@ -32,13 +22,6 @@ reference_colonies = {
 }
 
 test_eeg = {
-    #"eegmmidb": {
-        #"S011": [0, 1, 2, 3, 4, 5],
-        #"S012": [0, 1, 2, 3, 4, 5],
-        #"S013": [0, 1, 2, 3, 4, 5],
-        #"S014": [0, 1, 2, 3, 4, 5],
-        #"S015": [0, 1, 2, 3, 4, 5],
-    #},
     "grasplift": {
         "subj1": [0, 1, 2, 3],
         #"subj2": [0, 1, 2, 3, 4, 5],
@@ -52,6 +35,9 @@ test_eeg = {
 WINDOW_LENGTH = 1000 / 1000
 
 PERCENTILES = [(0.5, 0.99), (0.75, 0.99), (0.85, 0.99), (0.95, 0.99), (0.5, 0.95), (0.75, 0.95), (0.85, 0.95), (0.5, 0.85)]
+
+TARGET_BANDS = {k: v for k, v in BANDS.items() if k not in ["standard", "whole"]}
+# at the moment, standard and whole are too sweeping
 
 def get_window_event(raw, start_time, end_time, spec):
     for annotation in raw.annotations:
@@ -69,7 +55,7 @@ def get_window_event(raw, start_time, end_time, spec):
 ref_cache = defaultdict(lambda: defaultdict(dict))
 all_refs = set(ref for refs in reference_colonies.values() for ref in refs)
         
-for band_name, band in BANDS.items():
+for band_name, band in TARGET_BANDS.items():
     for source_type in ["vol", "csd", "inverse"]:
         for ref_dataset, refs in reference_colonies.items():
             for ref in refs:
@@ -91,7 +77,7 @@ for dataset, subjects in test_eeg.items():
 
     dataset_confusion = defaultdict(int)
     subject_results = {}
-    all_subjects_band_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    all_subjects_band_data = defaultdict(lambda: defaultdict(tuple[dict, int]))
 
     for subject, record_indices in tqdm(subjects.items(), desc="Subjects", disable=not INTERACTIVE):
         print(f"Subject: {subject}")
@@ -119,9 +105,7 @@ for dataset, subjects in test_eeg.items():
             n_windows = int(raw_record.duration // WINDOW_LENGTH)
             
             filtered_records = {}
-            for band_name, band in BANDS.items():
-                if band_name in ["standard", "whole"]:
-                    continue
+            for band_name, band in TARGET_BANDS.items():
                 print(f"    Filtering band: {band_name}")
                 low = band["low"]
                 high = min(band["high"], raw_baseline.info["sfreq"] / 2 - 1)
@@ -141,50 +125,57 @@ for dataset, subjects in test_eeg.items():
                 if not true_event:
                     continue
                 
-                for band_name in BANDS:
-                    if band_name in ["standard", "whole"]:
-                        continue
+                for band_name in TARGET_BANDS:
                     raw_window = filtered_records[band_name].copy().crop(tmin=start_time, tmax=end_time)
 
-                    colonies = compute_gain(prepared_inv, raw_window, inverse_mirror_map, lambda2, TIMESTEP,
+                    colonies = compute_gain(prepared_inv, raw_window, lambda2, TIMESTEP, inverse_mirror_map,
                                             include_vol=True, include_csd=True, include_inverse=True,
                                             include_pos=True, include_neg=True,
-                                            use_epochs=False, mirror=True)
+                                            use_epochs=False)
 
                     for (source, _), colony in colonies.items():
                         # need to make this temporal based so we can differentiate bteween different time windows
                         # (source, subject, epoch_id) => (list_of_band_colonies, true_event)
-                        all_subjects_band_data[subject][band_name][source].append((true_event, colony))
+                        
+                        # yeah broski we need to rewrite this file and actually decide what we're clustering on
+                        
+                        l = all_subjects_band_data[subject][source]
+                        if not l:
+                            l = ({}, true_event)
+                            all_subjects_band_data[subject][source] = l
+
+                        l[0][band_name] = colony
     
     source_band_pos_weights = {}
     source_band_neg_weights = {}
     
-    for source_type, subject_band_data in all_subjects_band_data.items():
-        for band_name, colony_data in subject_band_data.items():
-            X_pos = []
-            X_neg = []
-            y = []
-            
-            for _, entries in colony_data.items():
-                for true_event, colony in entries:
-                    pos_weights = colony.pos_weights()
-                    neg_weights = colony.neg_weights()
-                    X_pos.append(pos_weights)
-                    X_neg.append(neg_weights)
-                    y.append(true_event)
+    for subject, subject_data in all_subjects_band_data.items():
+        for source_type, (bands, true_event) in subject_data.items():
+            for band_name, colony_data in bands.items():
+                X_pos = []
+                X_neg = []
+                y = []
                 
-            clf = LogisticRegression()
-            clf.fit(X_pos, y)
-            pos_weights = np.abs(clf.coef_)
-            
-            for event_idx, event_name in enumerate(clf.classes_):
-                source_band_pos_weights[(source_type, event_name, band_name)] = pos_weights[event_idx]
+                for _, entries in colony_data.items():
+                    for true_event, colony in entries:
+                        pos_weights = colony.pos_weights()
+                        neg_weights = colony.neg_weights()
+                        X_pos.append(pos_weights)
+                        X_neg.append(neg_weights)
+                        y.append(true_event)
+                    
+                clf = LogisticRegression()
+                clf.fit(X_pos, y)
+                pos_weights = np.abs(clf.coef_)
+                
+                for event_idx, event_name in enumerate(clf.classes_):
+                    source_band_pos_weights[(source_type, event_name, band_name)] = pos_weights[event_idx]
 
-            clf.fit(X_neg, y)
-            neg_weights = np.abs(clf.coef_)
-            
-            for event_idx, event_name in enumerate(clf.classes_):
-                source_band_neg_weights[(source_type, event_name, band_name)] = neg_weights[event_idx]
+                clf.fit(X_neg, y)
+                neg_weights = np.abs(clf.coef_)
+                
+                for event_idx, event_name in enumerate(clf.classes_):
+                    source_band_neg_weights[(source_type, event_name, band_name)] = neg_weights[event_idx]
                 
     for subject in subjects.keys():
         subject_confusion = defaultdict(int)
@@ -209,16 +200,14 @@ for dataset, subjects in test_eeg.items():
                         pkey = (pstart, pend)
 
                         pos_lo, pos_hi = np.quantile(pos_weights, pstart), np.quantile(pos_weights, pend)
-                        neg_abs = np.abs(neg_weights)
-                        neg_lo, neg_hi = np.quantile(neg_abs, pstart), np.quantile(neg_abs, pend)
+                        neg_lo, neg_hi = np.quantile(neg_weights, 1 - pstart), np.quantile(neg_weights, 1 - pend)
                         pos_top = set(np.where((pos_weights >= pos_lo) & (pos_weights <= pos_hi))[0])
-                        neg_top = set(np.where((neg_abs >= neg_lo) & (neg_abs <= neg_hi))[0])
+                        neg_top = set(np.where((neg_weights >= neg_lo) & (neg_weights <= neg_hi))[0])
 
                         ref_pos_lo, ref_pos_hi = np.quantile(ref_pos_weights, pstart), np.quantile(ref_pos_weights, pend)
-                        ref_neg_abs = np.abs(ref_neg_weights)
-                        ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_abs, pstart), np.quantile(ref_neg_abs, pend)
+                        ref_neg_lo, ref_neg_hi = np.quantile(ref_neg_weights, 1 - pend), np.quantile(ref_neg_weights, 1 - pstart)
                         ref_pos_top = set(np.where((ref_pos_weights >= ref_pos_lo) & (ref_pos_weights <= ref_pos_hi))[0])
-                        ref_neg_top = set(np.where((ref_neg_abs >= ref_neg_lo) & (ref_neg_abs <= ref_neg_hi))[0])
+                        ref_neg_top = set(np.where((ref_neg_weights >= ref_neg_lo) & (ref_neg_weights <= ref_neg_hi))[0])
 
                         pos_union = pos_top | ref_pos_top
                         neg_union = neg_top | ref_neg_top
@@ -228,22 +217,15 @@ for dataset, subjects in test_eeg.items():
                         pos_sel = list(pos_top | ref_pos_top)
                         neg_sel = list(neg_top | ref_neg_top)
                         distance[ref]["pos"][band_name][pkey] = np.sqrt(np.sum((pos_weights[pos_sel] - ref_pos_weights[pos_sel]) ** 2)) if pos_sel else 0.0
-                        distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_abs[neg_sel] - ref_neg_abs[neg_sel]) ** 2)) if neg_sel else 0.0
+                        distance[ref]["neg"][band_name][pkey] = np.sqrt(np.sum((neg_weights[neg_sel] - ref_neg_weights[neg_sel]) ** 2)) if neg_sel else 0.0
 
             return overlaps, distance
         
         source_results = {}
         # how do we handle different CSD electrode arrays (sizes)?
         for source_type in ["inverse"]: #["csd", "inverse"]:
-            band_c = {}
-            t = None
-            for band in BANDS:
-                if band in ["standard", "whole"]:
-                    continue
-                for true_event, colony in all_subjects_band_data[source_type][band][subject]:
-                    t = true_event
-                    band_c[band] = colony
-            source_results[source_type] = (predict(source_type, band_c), t)
+            bands, te = all_subjects_band_data[subject][source_type]
+            source_results[source_type] = (predict(source_type, bands), te)
 
         best_score = -1
         best_ref = None
