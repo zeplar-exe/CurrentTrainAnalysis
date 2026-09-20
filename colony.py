@@ -276,7 +276,7 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
                  include_raw: bool = False, include_abs: bool = False,
                  include_pos: bool = False, include_neg: bool = False,
                  use_epochs: bool = True) -> ColonyMap:
-    if abs((colony_step / timestep) - round(colony_step / timestep)) < 1e-6:
+    if abs((colony_step / timestep) - round(colony_step / timestep)) > 1e-6:
         raise ValueError(f"Colony step ({colony_step}) must be a multiple of timestep ({timestep})")
     
     multis: ColonyMap = {}
@@ -376,7 +376,7 @@ if __name__ == "__main__":
         target_datasets = ["grasplift"]
         for dataset_index, dataset in enumerate(target_datasets):
             spec = get_dataset_spec(dataset)
-            target_subjects = spec["subjects"][:3]
+            target_subjects = spec["subjects"][:1]
             for subject_index, subject in enumerate(target_subjects):
                 subject_baseline_file, subject_active_files = load_subject(dataset, subject)
                 raw_baseline, events_baseline = read_subject_record(dataset, subject_baseline_file)
