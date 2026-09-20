@@ -4,13 +4,13 @@
     # loss is based on matching all of the same-cluster samples to each other, and then penalizing if same-cluster samples are far away from each other
         # perhaps we do contrastive stuff; penalize different-cluster samples that are too close
 # brother what the fuck are you talking about? that's just a regular clustering algorithm with extra steps
+    # oh I get it, it's just using silhouette score in a loop
 
 # !!! double check SD and variance across events in JASP for per-subject and across-subject/coalesce
 # !! also need to eyeball clusters in all subjects; 
 # !! ALSO we need to start using the eye control dataset, and an error detection dataset
 # need to look at overlap across per-band clusters
 
-# by the way: for the multi-colony for an event thingy, literally multiple instances of Colony starting at diff time points
 # by the way again: what if we split out by cluster and then pass the raw growth values into a supervised decoder on an ms basis? 
 
 # by the way... how do we, like, force a cluster to appear multiple time intra subject, OR multiple times intersubject to be considered a cluster?

@@ -21,8 +21,8 @@ ColonySource = Literal["vol", "csd", "inverse"]
 ColonyType = Literal["raw", "abs", "pos", "neg"]
 ColonyMap = dict[tuple[ColonySource, str], "MultiColony"]
 
-TIMESTEP = 50 / 1000 # s
-MULTICOLONY_STEP = 150 / 1000 # s
+TIMESTEP = 25 / 1000 # s
+MULTICOLONY_STEP = 75 / 1000 # s
 
 
 class Colony:

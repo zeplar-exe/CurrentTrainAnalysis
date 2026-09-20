@@ -60,8 +60,10 @@ for band_name, band in BANDS.items():
     # pass in a generator?!!
     # need to annotate with labels
     new_colonies = compute_gain(prepared_inv, raw_filtered,
-        lambda2, 50 / 1000, None, include_inverse=True, 
+        lambda2, 50 / 1000, None, include_vol=True, include_csd=True, include_inverse=True, 
         include_pos=True, include_neg=True)
+    
+    # 306 for every subject, we can use vol, csd, AND inverse
 
     for (source, group), new_colony in new_colonies.items():
         reg_colonies[(band_name, group)] = new_colony

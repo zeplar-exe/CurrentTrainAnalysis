@@ -55,7 +55,7 @@ DATASET_SPECS = {
             5: "Replace",
             6: "BothReleased",
         },
-        "event_time_padding": (-100 / 1000, -100 / 1000), # s
+        "event_time_padding": (-50 / 1000, 0 / 1000), # s
         "ignore_events": [3, 6],
     },
 }
