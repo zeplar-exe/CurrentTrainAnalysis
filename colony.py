@@ -352,22 +352,21 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
 
             cs = colonies[("inverse", group)]
             
-            for start_time, end_time in ann_list:
-                t = 0
-                while t < dur:
-                    t0 = t
-                    t += colony_step
-                    sample = sample[:, int((start_time + t0) * sfreq):int(min(end_time * sfreq, (start_time + t) * sfreq))]
-                
-                    if sample.shape[1] < timestep * sfreq:
-                        sample = np.pad(sample, ((0, 0), (0, int(timestep * sfreq - sample.shape[1]))))
-                    
-                    colony = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
-                    colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
-                    cs.append(colony)
+            t = 0
+            while t < dur:
+                t0 = t
+                t += colony_step
+                window = sample[:, int(t0 * sfreq):int(min(dur, t) * sfreq)]
 
-    for (source, group), colony_list in colonies:
-        multis[(source, group)] = MultiColony(colonies[(source, group)], size=colony_list[0].size, interval=colony_step)
+                if window.shape[1] < timestep * sfreq:
+                    window = np.pad(window, ((0, 0), (0, int(timestep * sfreq - window.shape[1]))))
+
+                colony = Colony(window.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
+                colony.feed(window, step=int(timestep * sfreq), sfreq=sfreq)
+                cs.append(colony)
+
+    for (source, group), colony_list in colonies.items():
+        multis[(source, group)] = MultiColony(colony_list, size=colony_list[0].size, interval=colony_step)
 
     return multis
 
