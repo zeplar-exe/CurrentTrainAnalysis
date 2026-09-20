@@ -317,7 +317,7 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
                     sample = data[:, int((start_time + t0) * sfreq):int(min(end_time, start_time + t) * sfreq)]
                 
                     if sample.shape[1] < timestep * sfreq:
-                        sample = np.pad(sample, ((0, 0), (0, timestep * sfreq - sample.shape[1])))
+                        sample = np.pad(sample, ((0, 0), (0, int(timestep * sfreq - sample.shape[1]))))
                     
                     colony = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
                     colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
@@ -360,7 +360,7 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
                     sample = sample[:, int((start_time + t0) * sfreq):int(min(end_time * sfreq, (start_time + t) * sfreq))]
                 
                     if sample.shape[1] < timestep * sfreq:
-                        sample = np.pad(sample, ((0, 0), (0, timestep * sfreq - sample.shape[1])))
+                        sample = np.pad(sample, ((0, 0), (0, int(timestep * sfreq - sample.shape[1]))))
                     
                     colony = Colony(sample.shape[0], include_raw=include_raw, include_abs=include_abs, include_pos=include_pos, include_neg=include_neg)
                     colony.feed(sample, step=int(timestep * sfreq), sfreq=sfreq)
