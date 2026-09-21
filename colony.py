@@ -12,7 +12,7 @@ from pathlib import Path
 from rich.live import Live
 from rich.panel import Panel
 from typing import Literal
-from core import DATASET_SPECS, BANDS, get_dataset_spec
+from core import COLONIES_ROOT, DATASET_SPECS, BANDS, get_dataset_spec
 
 warnings.filterwarnings("ignore", message="FastICA did not converge")
 warnings.filterwarnings("ignore", message=".*does not conform to MNE naming conventions.*")
@@ -120,7 +120,8 @@ class MultiColony:
         
         diff = len(other.colonies) - len(self.colonies)
         if diff > 0:
-            self.colonies.extend([Colony(self.size, include_raw=True, include_abs=True, include_pos=True, include_neg=True) for _ in range(diff)])
+            ref = self.colonies[0]
+            self.colonies.extend([Colony(self.size, include_raw=ref.include_raw, include_abs=ref.include_abs, include_pos=ref.include_pos, include_neg=ref.include_neg) for _ in range(diff)])
         for i, colony in enumerate(other.colonies):
             if colony.size != self.size:
                 raise ValueError(f"Cannot merge Colonies with different sizes: {self.size} vs {colony.size}")
@@ -387,14 +388,14 @@ if __name__ == "__main__":
         target_datasets = ["grasplift"]
         for dataset_index, dataset in enumerate(target_datasets):
             spec = get_dataset_spec(dataset)
-            target_subjects = spec["subjects"][:1]
+            target_subjects = spec["subjects"]
             for subject_index, subject in enumerate(target_subjects):
                 subject_baseline_file, subject_active_files = load_subject(dataset, subject)
-                raw_baseline, events_baseline = read_subject_record(dataset, subject_baseline_file)
-                output_dir = Path("./colonies") / dataset / subject
+                output_dir = COLONIES_ROOT / dataset / subject
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
-                inv, src, bem = setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=dataset=="grasplift")
+                raw_baseline, _ = read_subject_record(dataset, subject_baseline_file)
+                inv, src, bem = setup_inverse(dataset, subject, raw_baseline)
                 snr = 3.0
                 lambda2 = 1.0 / (snr ** 2)
                 prepared_inv = prepare_inverse_operator(

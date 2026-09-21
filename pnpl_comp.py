@@ -11,12 +11,20 @@ from pnpl.datasets import LibriBrainWord
 from colony import compute_gain, setup_inverse
 from core import BANDS
 
-SFREQ = 250
+# load all pnpl csv files
+# setup pnpl loading for subj0 in colony.py
+# generate multicolonies
+# appropriate (or fix and reuse) colony decoding to determine probabilities per word
+# win with 90% accuracy
+
+SFREQ = 250.0
 TMIN, TMAX = 0.0, 10.0
 DATA_PATH = Path(".") / "pnpl" / "libribrain_word"
 TRAIN_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(1, 5)]   # sessions 1-4
 VAL_RUNS   = [("0", "5", "Sherlock1", "1")]                            # session 5
 TEST_RUNS  = [("0", "6", "Sherlock1", "1")] 
+
+# there are 10 sherlock sessions
 
 one_run = LibriBrainWord(
     data_path=str(DATA_PATH),

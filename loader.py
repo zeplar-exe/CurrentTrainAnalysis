@@ -5,10 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from colony import Colony, ColonySource, ColonyType, MultiColony
-from core import Band, DATASET_SPECS, get_dataset_spec
-
-COALESCE_ROOT = Path("coalesce")
-COLONIES_ROOT = Path("colonies")
+from core import Band, DATASET_SPECS, get_dataset_spec, COLONIES_ROOT, COALESCE_ROOT
 
 
 class SubjectSet:

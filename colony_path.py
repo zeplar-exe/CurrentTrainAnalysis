@@ -8,9 +8,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from colony import DATASET_SPECS, BANDS, Colony
+from core import GROWTH_ROOT, COALESCE_ROOT
 
-GROWTH_ROOT = Path("growth")
-COALESCE_ROOT = Path("coalesce")
 GROWTH_INDEX = {"raw": 0, "pos": 1, "neg": 2}
 
 presets = {

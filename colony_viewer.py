@@ -15,7 +15,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy.spatial import KDTree
+from pathlib import Path
 import mne
+import subprocess, tempfile, webbrowser
 
 _fsaverage_coords = None
 
@@ -28,20 +30,41 @@ def fsaverage_coordinates():
     return _fsaverage_coords
 
 
+def _resolve_path(path):
+    if ":" in path and "@" in path.split(":")[0]:
+        suffix = Path(path.split(":")[-1]).suffix
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp.close()
+        print(f"Fetching {path}...")
+        subprocess.run(["scp", path, tmp.name], check=True)
+        print(f"  -> {tmp.name}")
+        return tmp.name
+    return path
+
+
 def load(path):
-    df = pd.read_csv(path)
+    df = pd.read_csv(_resolve_path(path))
     if "electrode" in df.columns:
-        return df, "electrode"
+        return [df], "electrode"
     nums = df.select_dtypes("number").columns.tolist()
+    value_cols = [c for c in nums if c.startswith("value")]
+    if len(value_cols) > 1:
+        coord_cols = [c for c in nums if c not in value_cols]
+        frames = []
+        for vc in sorted(value_cols):
+            sub = df[coord_cols + [vc]].copy()
+            sub.columns = ["x", "y", "z", "value"]
+            frames.append(sub)
+        return frames, "xyz"
     if "value" in df.columns:
         val_col = "value"
         coord_cols = [c for c in nums if c != "value"]
     else:
         coord_cols = nums[:3]
         val_col = nums[3]
-    df = df[coord_cols + [val_col]].copy()
-    df.columns = ["x", "y", "z", "value"]
-    return df, "xyz"
+    sub = df[coord_cols + [val_col]].copy()
+    sub.columns = ["x", "y", "z", "value"]
+    return [sub], "xyz"
 
 def get_montage_positions():
     montage = mne.channels.make_standard_montage("standard_1005")
@@ -167,34 +190,37 @@ def _colony_to_df(colony, coordinates, sign):
     return df
 
 
+def _make_colony_fig(colony, coordinates, name, sign):
+    df = _colony_to_df(colony, coordinates, sign)
+    fig = go.Figure()
+    all_coords = df[["x", "y", "z"]].values
+    for trace in make_3d_traces(df, f"{name}_{sign}"):
+        fig.add_trace(trace)
+    density_lines = []
+    for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
+        subset = df[df.value >= df.value.quantile(threshold)]
+        d = vertex_density(subset[["x", "y", "z"]].values, all_coords)
+        density_lines.append(f"{pct_label}: {d:.3f}")
+    fig.update_layout(
+        scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
+        title=f"{name} ({sign})",
+        margin=dict(l=0, r=0, t=80, b=0),
+        legend=dict(itemclick="toggle", itemdoubleclick="toggleothers"),
+    )
+    if density_lines:
+        fig.add_annotation(text="Density: " + " | ".join(density_lines),
+                           xref="paper", yref="paper", x=0.5, y=1.05, showarrow=False, font=dict(size=11))
+    return fig
+
+
 def show_colony(colony, coordinates=None, name="colony", signs=("pos", "neg"), output=None):
     if coordinates is None:
         coordinates = fsaverage_coordinates()
-    from plotly.subplots import make_subplots
     figs = []
     for sign in signs:
         if not getattr(colony, f"include_{sign}", False):
             continue
-        df = _colony_to_df(colony, coordinates, sign)
-        fig = go.Figure()
-        all_coords = df[["x", "y", "z"]].values
-        for trace in make_3d_traces(df, f"{name}_{sign}"):
-            fig.add_trace(trace)
-        density_lines = []
-        for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
-            subset = df[df.value >= df.value.quantile(threshold)]
-            d = vertex_density(subset[["x", "y", "z"]].values, all_coords)
-            density_lines.append(f"{pct_label}: {d:.3f}")
-        fig.update_layout(
-            scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
-            title=f"{name} ({sign})",
-            margin=dict(l=0, r=0, t=80, b=0),
-            legend=dict(itemclick="toggle", itemdoubleclick="toggleothers"),
-        )
-        if density_lines:
-            fig.add_annotation(text="Density: " + " | ".join(density_lines),
-                               xref="paper", yref="paper", x=0.5, y=1.05, showarrow=False, font=dict(size=11))
-        figs.append((f"{name}_{sign}", fig))
+        figs.append((f"{name}_{sign}", _make_colony_fig(colony, coordinates, name, sign)))
 
     if output:
         _write_tabbed_html(figs, output)
@@ -204,34 +230,45 @@ def show_colony(colony, coordinates=None, name="colony", signs=("pos", "neg"), o
     return figs
 
 
-def show_colonies(colonies: list[tuple[str, "Colony"]], coordinates=None, signs=("pos", "neg"), output=None):
+def show_multicolony(multi, coordinates=None, name="colony", signs=("pos", "neg"), output=None):
+    if coordinates is None:
+        coordinates = fsaverage_coordinates()
+    figs = []
+    for sign in signs:
+        if not getattr(multi.colonies[0], f"include_{sign}", False):
+            continue
+        for i, colony in enumerate(multi.colonies):
+            t_ms = int(i * multi.interval * 1000)
+            label = f"{name}_{sign}_{t_ms}ms"
+            figs.append((label, _make_colony_fig(colony, coordinates, f"{name} t={t_ms}ms", sign)))
+
+    if output:
+        _write_tabbed_html(figs, output)
+    else:
+        for _, fig in figs:
+            fig.show()
+    return figs
+
+
+def show_colonies(colonies: list[tuple[str, "Colony | MultiColony"]], coordinates=None, signs=("pos", "neg"), output=None):
+    from colony import MultiColony
     if coordinates is None:
         coordinates = fsaverage_coordinates()
     figs = []
     for name, colony in colonies:
-        for sign in signs:
-            if not getattr(colony, f"include_{sign}", False):
-                continue
-            df = _colony_to_df(colony, coordinates, sign)
-            fig = go.Figure()
-            all_coords = df[["x", "y", "z"]].values
-            for trace in make_3d_traces(df, f"{name}_{sign}"):
-                fig.add_trace(trace)
-            density_lines = []
-            for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
-                subset = df[df.value >= df.value.quantile(threshold)]
-                d = vertex_density(subset[["x", "y", "z"]].values, all_coords)
-                density_lines.append(f"{pct_label}: {d:.3f}")
-            fig.update_layout(
-                scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
-                title=f"{name} ({sign})",
-                margin=dict(l=0, r=0, t=80, b=0),
-                legend=dict(itemclick="toggle", itemdoubleclick="toggleothers"),
-            )
-            if density_lines:
-                fig.add_annotation(text="Density: " + " | ".join(density_lines),
-                                   xref="paper", yref="paper", x=0.5, y=1.05, showarrow=False, font=dict(size=11))
-            figs.append((f"{name}_{sign}", fig))
+        if isinstance(colony, MultiColony):
+            for sign in signs:
+                if not getattr(colony.colonies[0], f"include_{sign}", False):
+                    continue
+                for i, sub in enumerate(colony.colonies):
+                    t_ms = int(i * colony.interval * 1000)
+                    label = f"{name}_{sign}_{t_ms}ms"
+                    figs.append((label, _make_colony_fig(sub, coordinates, f"{name} t={t_ms}ms", sign)))
+        else:
+            for sign in signs:
+                if not getattr(colony, f"include_{sign}", False):
+                    continue
+                figs.append((f"{name}_{sign}", _make_colony_fig(colony, coordinates, name, sign)))
 
     if output:
         _write_tabbed_html(figs, output)
@@ -242,74 +279,116 @@ def show_colonies(colonies: list[tuple[str, "Colony"]], coordinates=None, signs=
 
 
 def _write_tabbed_html(figs, output_path):
+    FIG_HEIGHT = 700
     tabs_html = []
     divs_html = []
     for i, (label, fig) in enumerate(figs):
+        fig.update_layout(height=FIG_HEIGHT, autosize=True)
         div_id = f"tab-{i}"
         active = "active" if i == 0 else ""
         display = "block" if i == 0 else "none"
         tabs_html.append(f'<button class="tab-btn {active}" onclick="switchTab({i})">{label}</button>')
         divs_html.append(f'<div id="{div_id}" class="tab-content" style="display:{display}">{fig.to_html(full_html=False, include_plotlyjs=(i == 0))}</div>')
 
+    n = len(figs)
     html = f"""<!DOCTYPE html><html><head><style>
+    body {{ margin: 0; }}
+    .tab-bar {{ display: flex; flex-wrap: wrap; gap: 2px; align-items: center; padding: 4px; }}
     .tab-btn {{ padding: 8px 16px; cursor: pointer; border: 1px solid #ccc; background: #f0f0f0; }}
     .tab-btn.active {{ background: #fff; border-bottom: 2px solid #333; }}
-    .tab-content {{ width: 100%; }}
+    .sync-btn {{ padding: 8px 16px; cursor: pointer; border: 1px solid #69b; background: #def; margin-left: auto; }}
+    .tab-content {{ height: {FIG_HEIGHT}px; }}
     </style></head><body>
-    <div>{"".join(tabs_html)}</div>
+    <div class="tab-bar">{"".join(tabs_html)}<button class="sync-btn" onclick="syncCamera()">Sync Camera</button></div>
     {"".join(divs_html)}
     <script>
+    var savedCamera = null;
+    function getPlotDiv(idx) {{
+        var tab = document.getElementById('tab-' + idx);
+        return tab ? tab.querySelector('.plotly-graph-div') : null;
+    }}
     function switchTab(idx) {{
-        document.querySelectorAll('.tab-content').forEach((d, i) => d.style.display = i === idx ? 'block' : 'none');
-        document.querySelectorAll('.tab-btn').forEach((b, i) => b.className = 'tab-btn' + (i === idx ? ' active' : ''));
+        document.querySelectorAll('.tab-content').forEach(function(d, i) {{ d.style.display = i === idx ? 'block' : 'none'; }});
+        document.querySelectorAll('.tab-btn').forEach(function(b, i) {{ b.className = 'tab-btn' + (i === idx ? ' active' : ''); }});
+        var div = getPlotDiv(idx);
+        if (div) {{
+            requestAnimationFrame(function() {{
+                Plotly.Plots.resize(div);
+                if (savedCamera) Plotly.relayout(div, {{'scene.camera': savedCamera}});
+            }});
+        }}
+    }}
+    function syncCamera() {{
+        var active = -1;
+        document.querySelectorAll('.tab-content').forEach(function(d, i) {{ if (d.style.display !== 'none') active = i; }});
+        if (active < 0) return;
+        var div = getPlotDiv(active);
+        if (!div || !div.layout || !div.layout.scene) return;
+        savedCamera = JSON.parse(JSON.stringify(div.layout.scene.camera));
+        var others = [];
+        for (var i = 0; i < {n}; i++) {{ if (i !== active) others.push(i); }}
+        (function applyNext(list, cb) {{
+            if (!list.length) {{ cb(); return; }}
+            var idx = list.shift();
+            var tab = document.getElementById('tab-' + idx);
+            tab.style.display = 'block';
+            requestAnimationFrame(function() {{
+                var d = getPlotDiv(idx);
+                if (d) {{
+                    Plotly.Plots.resize(d);
+                    Plotly.relayout(d, {{'scene.camera': savedCamera}}).then(function() {{
+                        tab.style.display = 'none';
+                        applyNext(list, cb);
+                    }});
+                }} else {{
+                    tab.style.display = 'none';
+                    applyNext(list, cb);
+                }}
+            }});
+        }})(others, function() {{ alert('Camera synced to all tabs'); }});
     }}
     </script></body></html>"""
 
-    Path(output_path).write_text(html)
-    print(f"saved {output_path}")
+    out = Path(output_path).resolve()
+    out.write_text(html)
+    print(f"saved {out}")
+    webbrowser.open(f"file://{out}")
 
 
-def _build_fig_from_paths(mode, paths):
+def _build_single_fig(mode, df, name, montage_pos=None):
     fig = go.Figure()
     density_lines = []
 
     if mode == "inverse":
-        for path in paths:
-            df, _ = load(path)
-            name = path.rsplit("/", 1)[-1].replace(".csv", "")
-            all_coords = df[["x", "y", "z"]].values
-            for trace in make_3d_traces(df, name):
-                fig.add_trace(trace)
-            for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
-                subset = df[df.value >= df.value.quantile(threshold)]
-                d = vertex_density(subset[["x", "y", "z"]].values, all_coords)
-                density_lines.append(f"{name} {pct_label}: {d:.3f}")
+        all_coords = df[["x", "y", "z"]].values
+        for trace in make_3d_traces(df, name):
+            fig.add_trace(trace)
+        for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
+            subset = df[df.value >= df.value.quantile(threshold)]
+            d = vertex_density(subset[["x", "y", "z"]].values, all_coords)
+            density_lines.append(f"{name} {pct_label}: {d:.3f}")
         fig.update_layout(
             scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
-            title="Source-space colony — " + ", ".join(paths),
+            title=f"Source-space colony — {name}",
             margin=dict(l=0, r=0, t=80, b=0),
             legend=dict(itemclick="toggle", itemdoubleclick="toggleothers"),
         )
     else:
-        montage_pos = get_montage_positions()
-        for path in paths:
-            df, _ = load(path)
-            name = path.rsplit("/", 1)[-1].replace(".csv", "")
-            for trace in make_2d_traces(df, name, montage_pos):
-                fig.add_trace(trace)
-            matched = df.copy()
-            matched["electrode"] = matched["electrode"].str.upper()
-            matched = matched[matched["electrode"].isin(montage_pos)]
-            if not matched.empty:
-                all_coords = np.array([montage_pos[e] for e in matched["electrode"]])
-                for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
-                    subset_mask = matched["value"] >= matched["value"].quantile(threshold)
-                    subset_coords = np.array([montage_pos[e] for e in matched.loc[subset_mask, "electrode"]])
-                    d = vertex_density(subset_coords, all_coords)
-                    density_lines.append(f"{name} {pct_label}: {d:.3f}")
+        for trace in make_2d_traces(df, name, montage_pos):
+            fig.add_trace(trace)
+        matched = df.copy()
+        matched["electrode"] = matched["electrode"].str.upper()
+        matched = matched[matched["electrode"].isin(montage_pos)]
+        if not matched.empty:
+            all_coords = np.array([montage_pos[e] for e in matched["electrode"]])
+            for pct_label, threshold in [("top 5%", 0.95), ("top 10%", 0.90), ("top 15%", 0.85), ("top 25%", 0.75)]:
+                subset_mask = matched["value"] >= matched["value"].quantile(threshold)
+                subset_coords = np.array([montage_pos[e] for e in matched.loc[subset_mask, "electrode"]])
+                d = vertex_density(subset_coords, all_coords)
+                density_lines.append(f"{name} {pct_label}: {d:.3f}")
         add_head_outline(fig)
         fig.update_layout(
-            title=f"Electrode colony ({mode}) — " + ", ".join(paths),
+            title=f"Electrode colony ({mode}) — {name}",
             xaxis=dict(scaleanchor="y", showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             margin=dict(l=0, r=0, t=80, b=0),
@@ -323,6 +402,21 @@ def _build_fig_from_paths(mode, paths):
     return fig
 
 
+def _build_figs_from_paths(mode, paths):
+    montage_pos = get_montage_positions() if mode != "inverse" else None
+    figs = []
+    for path in paths:
+        frames, _ = load(path)
+        base_name = path.rsplit("/", 1)[-1].replace(".csv", "")
+        if len(frames) == 1:
+            figs.append((base_name, _build_single_fig(mode, frames[0], base_name, montage_pos)))
+        else:
+            for i, df in enumerate(frames):
+                label = f"{base_name}_t{i}"
+                figs.append((label, _build_single_fig(mode, df, label, montage_pos)))
+    return figs
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <inverse|vol|csd> <file1.csv> [file2.csv ...]")
@@ -330,19 +424,15 @@ if __name__ == "__main__":
         sys.exit(1)
 
     mode = sys.argv[1]
-    args = sys.argv[2:]
+    paths = sys.argv[2:]
 
-    if "--tabs" in args:
-        args.remove("--tabs")
-        figs = []
-        for path in args:
-            name = path.rsplit("/", 1)[-1].replace(".csv", "")
-            fig = _build_fig_from_paths(mode, [path])
-            figs.append((name, fig))
-        _write_tabbed_html(figs, f"colony_viewer_{mode}.html")
+    figs = _build_figs_from_paths(mode, paths)
+
+    output_name = f"colony_viewer_{mode}.html"
+    if len(figs) == 1:
+        figs[0][1].write_html(output_name, include_plotlyjs=True)
+        figs[0][1].show()
     else:
-        fig = _build_fig_from_paths(mode, args)
-        output_name = f"colony_viewer_{mode}.html"
-        fig.write_html(output_name, include_plotlyjs=True)
-        fig.show()
-        print(f"saved {output_name}")
+        _write_tabbed_html(figs, output_name)
+
+    print(f"saved {output_name}")

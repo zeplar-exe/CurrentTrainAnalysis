@@ -1,6 +1,8 @@
 from pathlib import Path
 import sys
 import mne
+
+from core import COALESCE_ROOT
 mne.set_log_level("WARNING")
 from mne.minimum_norm import prepare_inverse_operator
 import pandas as pd
@@ -59,8 +61,8 @@ for band_name, band in TARGET_BANDS.items():
     for source_type in ["vol", "csd", "inverse"]:
         for ref_dataset, refs in reference_colonies.items():
             for ref in refs:
-                pos_path = Path(f"coalesce/{ref_dataset}/{source_type}/{band_name}/{ref}/pos.csv")
-                neg_path = Path(f"coalesce/{ref_dataset}/{source_type}/{band_name}/{ref}/neg.csv")
+                pos_path = COALESCE_ROOT / Path(f"{ref_dataset}/{source_type}/{band_name}/{ref}/pos.csv")
+                neg_path = COALESCE_ROOT / Path(f"{ref_dataset}/{source_type}/{band_name}/{ref}/neg.csv")
                 
                 pos_df = pd.read_csv(pos_path)
                 neg_df = pd.read_csv(neg_path)

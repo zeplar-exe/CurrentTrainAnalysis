@@ -3,6 +3,10 @@ from typing import Literal
 
 Band = Literal["whole", "standard", "theta", "delta", "alpha", "beta", "gamma"]
 
+COLONIES_ROOT = Path("colonies")
+COALESCE_ROOT = Path("coalesce")
+GROWTH_ROOT = Path("growth")
+
 BANDS = {
     "whole": {
         "low": 1,
