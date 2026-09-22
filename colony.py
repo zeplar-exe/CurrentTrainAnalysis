@@ -27,7 +27,7 @@ MULTICOLONY_STEP = 75 / 1000 # s
 
 class Colony:
     DEVIATION_RESOLUTION = 2.0 # s
-    
+
     def __init__(self, size: int, include_raw: bool = False, include_abs: bool = False, include_pos: bool = False, include_neg: bool = False):
         self.size = size
         self.include_raw = include_raw
@@ -42,6 +42,19 @@ class Colony:
             self.colony_pos = np.zeros(size)
         if include_neg:
             self.colony_neg = np.zeros(size)
+        
+    @staticmethod
+    def _safe_weights(numerator: np.ndarray, denominator: float) -> np.ndarray:
+        if np.isclose(denominator, 0.0):
+            return np.zeros_like(numerator, dtype=float)
+        
+        vals = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(numerator, dtype=float),
+            where=denominator != 0,
+        )
+        return np.nan_to_num(np.minimum(1, vals), nan=0.0, posinf=0.0, neginf=0.0)
         
     def feed(self, data: np.ndarray, step: int, sfreq: int, deviation=True):
         if deviation:
@@ -65,17 +78,21 @@ class Colony:
             last_matrix = current_matrix
     
     def raw_weights(self):
-        return np.minimum(1, self.colony_raw / np.percentile(self.colony_raw, 99))
-    
+        pc = np.percentile(self.colony_raw, 99)
+        return Colony._safe_weights(self.colony_raw, pc)
+
     def abs_weights(self):
-        return np.minimum(1, (self.colony_abs - np.min(self.colony_abs)) / np.percentile(self.colony_abs, 99))
-    
+        pc = np.percentile(self.colony_abs, 99)
+        return Colony._safe_weights(self.colony_abs - np.min(self.colony_abs), pc)
+
     def pos_weights(self):
-        return np.minimum(1, (self.colony_pos - np.min(self.colony_pos)) / np.percentile(self.colony_pos, 99))
+        pc = np.percentile(self.colony_pos, 99)
+        return Colony._safe_weights(self.colony_pos - np.min(self.colony_pos), pc)
 
     def neg_weights(self):
-        return np.minimum(1, (self.colony_neg - np.max(self.colony_neg)) / -np.percentile(np.abs(self.colony_neg), 99))
-    
+        pc = np.percentile(np.abs(self.colony_neg), 99)
+        return Colony._safe_weights(self.colony_neg - np.max(self.colony_neg), -pc)
+
     def merge(self, other: "Colony"):
         if self.size != other.size:
             raise ValueError(f"Cannot merge Colonies with different sizes: {self.size} vs {other.size}")
@@ -101,16 +118,28 @@ class MultiColony:
         self.interval = interval
     
     def raw_weights(self):
-        return np.array([colony.raw_weights() for colony in self.colonies])
+        last_idx = len(self.colonies)
+        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_raw):
+            last_idx -= 1
+        return np.array([colony.raw_weights() for colony in self.colonies[:last_idx]])
     
     def abs_weights(self):
-        return np.array([colony.abs_weights() for colony in self.colonies])
+        last_idx = len(self.colonies)
+        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_abs):
+            last_idx -= 1
+        return np.array([colony.abs_weights() for colony in self.colonies[:last_idx]])
     
     def pos_weights(self):
-        return np.array([colony.pos_weights() for colony in self.colonies])
+        last_idx = len(self.colonies)
+        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_pos):
+            last_idx -= 1
+        return np.array([colony.pos_weights() for colony in self.colonies[:last_idx]])
 
     def neg_weights(self):
-        return np.array([colony.neg_weights() for colony in self.colonies])
+        last_idx = len(self.colonies)
+        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_neg):
+            last_idx -= 1
+        return np.array([colony.neg_weights() for colony in self.colonies[:last_idx]])
     
     def merge(self, other: "MultiColony"):
         if self.interval != other.interval:
@@ -238,9 +267,8 @@ def build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno):
 
     return mirror_map
 
-
-def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False):
-    save_file = Path("./inverse") / dataset / subject / "operator.fif"
+def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False, info=None, root=Path("./inverse")):
+    save_file = root / dataset / subject / "operator.fif"
     save_file.parent.mkdir(parents=True, exist_ok=True)
     
     fs_dir = mne.datasets.fetch_fsaverage(verbose=True)
@@ -248,19 +276,18 @@ def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False):
     src = fs_dir / "bem" / "fsaverage-ico-5-src.fif"
     bem = fs_dir / "bem" / "fsaverage-5120-5120-5120-bem-sol.fif"
     
-    print(save_file.absolute())
     if save_file.exists():
         return read_inverse_operator(save_file.absolute()), src, bem
 
-    f = mne.make_forward_solution(raw_baseline.info, trans='fsaverage', src=src, bem=bem, eeg=True)
+    f = mne.make_forward_solution(raw_baseline.info if raw_baseline else info, trans='fsaverage', src=src, bem=bem, eeg=True)
 
     noise_cov = mne.compute_raw_covariance(
         raw_baseline, 
         method='shrunk'
-    ) if not ad_hoc_resting else mne.make_ad_hoc_cov(raw_baseline.info)
+    ) if not ad_hoc_resting else mne.make_ad_hoc_cov(raw_baseline.info if raw_baseline else info)
 
     inverse_operator = make_inverse_operator(
-        raw_baseline.info, 
+        raw_baseline.info if raw_baseline else info,
         forward=f, 
         noise_cov=noise_cov, 
         loose="auto",
@@ -297,13 +324,13 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
     
     event_id = {name: i + 1 for i, name in enumerate(grouped_annotations)}
 
-    csd_data = mne.preprocessing.compute_current_source_density(raw.copy()).get_data()
-    vol_data = raw.get_data()
 
     ds = []
     if include_vol:
+        vol_data = raw.get_data()
         ds.append(("vol", vol_data))
     if include_csd:
+        csd_data = mne.preprocessing.compute_current_source_density(raw.copy()).get_data()
         ds.append(("csd", csd_data))
     for source, data in ds:
         for group, anns in grouped_annotations.items():
@@ -351,7 +378,8 @@ def compute_gain(prepared_inv: InverseOperator, raw: mne.io.Raw | mne.io.RawArra
         stc_gen = apply_inverse_epochs(mne_epochs, prepared_inv,
             lambda2=lambda2,
             method="dSPM", prepared=True,
-            return_generator=True)
+            return_generator=True,
+            verbose=False)
 
         for stc, (group, dur) in zip(stc_gen, ann_list):
             actual_samples = min(int(dur * sfreq), stc.data.shape[1])

@@ -213,15 +213,21 @@ def _make_colony_fig(colony, coordinates, name, sign):
     return fig
 
 
-def show_colony(colony, coordinates=None, name="colony", signs=("pos", "neg"), output=None):
+
+def show_colony(colony, coordinates=None, name="colony", with_pos=True, with_neg=False, output=None):
+    from colony import MultiColony
     if coordinates is None:
         coordinates = fsaverage_coordinates()
+    signs = []
+    if with_pos:
+        signs.append("pos")
+    if with_neg:
+        signs.append("neg")
+    if isinstance(colony, MultiColony):
+        return show_multicolony(colony, coordinates, name, signs, output)
     figs = []
     for sign in signs:
-        if not getattr(colony, f"include_{sign}", False):
-            continue
         figs.append((f"{name}_{sign}", _make_colony_fig(colony, coordinates, name, sign)))
-
     if output:
         _write_tabbed_html(figs, output)
     else:
@@ -242,11 +248,9 @@ def show_multicolony(multi, coordinates=None, name="colony", signs=("pos", "neg"
             label = f"{name}_{sign}_{t_ms}ms"
             figs.append((label, _make_colony_fig(colony, coordinates, f"{name} t={t_ms}ms", sign)))
 
-    if output:
-        _write_tabbed_html(figs, output)
-    else:
-        for _, fig in figs:
-            fig.show()
+    if not output:
+        output = f"colony_{name}.html"
+    _write_tabbed_html(figs, output)
     return figs
 
 
