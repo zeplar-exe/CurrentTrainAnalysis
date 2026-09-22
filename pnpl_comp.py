@@ -215,7 +215,7 @@ def _train_clf(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str]
         clf = model_container.get((source, lb)) or \
             NeuralNetClassifier(WordCNN(len(b)), max_epochs=1, lr=0.001, batch_size=1, train_split=None, verbose=0,
                                 criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
-                                device='cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+                                device='cuda' if torch.cuda.is_available() else 'cpu')
 
         clf.criterion__weight = torch.tensor([neg_w, pos_w], dtype=torch.float32)
         clf.partial_fit(b[np.newaxis], np.array([int(binary)], dtype=np.int64))
@@ -225,10 +225,12 @@ def _train_clf(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str]
 def train(run, do_colony=True, do_clf=True):
     if do_colony:
         i = 0
-        for meg, label_id, run_info in tqdm(run, desc="Training", unit="window"):
+        for meg, label_id, run_info in tqdm(run, desc="Training colonies", unit="window"):
             if i == 500:
                 break
             
+            print(f"Digesting run {i}")
+
             word = run.id_to_word[int(label_id)]
             label = normalize_word(word)
             raw = create_raw(meg)
@@ -236,15 +238,19 @@ def train(run, do_colony=True, do_clf=True):
                 _digest(raw, primary_colonies_words, label)
             if label in MOSES_VOCAB_TO_ID:
                 _digest(raw, moses_colonies_words, label)
-                
+
             i += 1
-    
+            if i % 100 == 0:
+                print(f"Digested {i} samples...")
+
     if do_clf:
         i = 0
-        for meg, label_id, run_info in tqdm(run, desc="Training", unit="window"):
+        for meg, label_id, run_info in tqdm(run, desc="Training CLFs", unit="window"):
             if i == 500:
                 break
             
+            print(f"Training on run {i}")
+
             word = run.id_to_word[int(label_id)]
             label = normalize_word(word)
             raw = create_raw(meg)
@@ -252,8 +258,10 @@ def train(run, do_colony=True, do_clf=True):
                 _train_clf(raw, primary_colonies_words, primary_band_clfs, label)
             if label in MOSES_VOCAB_TO_ID:
                 _train_clf(raw, moses_colonies_words, moses_band_clfs, label)
-                
+
             i += 1
+            if i % 100 == 0:
+                print(f"Trained {i} samples...")
 
 def model(meg: np.ndarray):
     raw = create_raw(meg)
@@ -326,13 +334,19 @@ def validate(run):
     success = 0
     fail = 0
 
+    n_val = 0
     for meg, label_id, run_info in tqdm(run, desc="Validating", unit="window"):
         word = run.id_to_word[int(label_id)]
         label = normalize_word(word)
-        
+
         if label not in PRIMARY_VOCAB_TO_ID and label not in MOSES_VOCAB_TO_ID:
             continue
-    
+
+        n_val += 1
+        if n_val % 50 == 0:
+            total = success + fail
+            print(f"Validating {n_val}... {success}/{total} ({success/total*100:.1f}%)" if total else f"Validating {n_val}...")
+
         _, _, p, m = model(meg)
         print("Primary", p)
         print("Moses", m)
@@ -373,7 +387,7 @@ def main():
         train(one_run)
         save_colony_state(f"pnpl/models/colony_run{i}.pt")
         
-        print(f"Finished training on run {i}, validating:")
+        print(f"Finished training run {i}, saving and validating...")
         
         for j, run in enumerate(VALIDATION_RUNS):
             one_run = LibriBrainWord(
