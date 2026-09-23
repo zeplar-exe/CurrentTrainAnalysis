@@ -59,7 +59,7 @@ TARGET_BANDS = BANDS.copy()
 del TARGET_BANDS["whole"]
 del TARGET_BANDS["standard"]
 
-PERCENTILE = 0.75
+PERCENTILE = 0.975
 
 MODEL_STATE_PATH = Path("./pnpl/model_state.pkl")
 
@@ -95,15 +95,18 @@ class WordCNN(nn.Module):
     def __init__(self, n_channels):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv1d(n_channels, 64, kernel_size=5, padding=2),
+            nn.Conv1d(n_channels, 512, kernel_size=5, padding=2),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.Conv1d(512, 512, kernel_size=5, padding=2),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Conv1d(128, 64, kernel_size=3, padding=1),
+            nn.Conv1d(512, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
-            nn.Linear(64, 2),
+            nn.Linear(256, 2),
         )
 
     def forward(self, X):
@@ -168,29 +171,25 @@ def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], M
             else:
                 colony_container[k] = new_colony
 
-def _train_clf(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], model_container: dict[tuple[str, str], NeuralNetClassifier], label: str):
+def _collect_sample(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], label: str) -> dict[tuple[str, str], tuple[np.ndarray, int]]:
     label_distribution[label] += 1
-    total = sum(label_distribution.values())
-    pos_count = label_distribution[label]
-    neg_count = total - pos_count
-    neg_w = pos_count / total if total > 0 else 0.5
-    pos_w = neg_count / total if total > 0 else 0.5
+    result = {}
 
     band_grouped = groupby(sorted(colony_container.items(), key=lambda x: (x[0][0], x[0][2])), lambda x: (x[0][0], x[0][2]))
     for (source, lb), group in band_grouped:
-        binary = lb == label
+        binary = int(lb == label)
         b = []
 
         for (_, band_name, _), colony in group:
             weights = colony.pos_weights()
-        
+
             band = TARGET_BANDS[band_name]
             low = band["low"]
             high = min(band["high"], SFREQ / 2.0 - 1)
 
             raw_filtered = raw.copy()
             raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4, verbose='error')
-            
+
             if source == "vol":
                 src = raw_filtered.get_data().astype(np.float32)
             elif source == "inverse":
@@ -210,17 +209,33 @@ def _train_clf(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str]
                 t1 = min(t0 + win_samples, src.shape[1])
                 b.append(src[top, t0:t1])
 
-        b = np.concatenate(b)
-        
+        result[(source, lb)] = (np.concatenate(b), binary)
+    return result
+
+
+def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], model_container: dict[tuple[str, str], NeuralNetClassifier], epochs=20, batch_size=32):
+    for (source, lb), samples in buffers.items():
+        X = np.stack([s[0] for s in samples])
+        y = np.array([s[1] for s in samples], dtype=np.int64)
+
+        pos_count = y.sum()
+        neg_count = len(y) - pos_count
+        pos_w = neg_count / len(y) if len(y) > 0 else 0.5
+        neg_w = pos_count / len(y) if len(y) > 0 else 0.5
+
+        n_channels = X.shape[1]
+
         clf = model_container.get((source, lb)) or \
-            NeuralNetClassifier(WordCNN(len(b)), max_epochs=1, lr=0.001, batch_size=1, train_split=None, verbose=0,
+            NeuralNetClassifier(WordCNN(n_channels), max_epochs=epochs, lr=0.1, batch_size=batch_size, train_split=None, verbose=0,
                                 criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
-                                device='cuda' if torch.cuda.is_available() else 'cpu')
+                                device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
         clf.criterion__weight = torch.tensor([neg_w, pos_w], dtype=torch.float32)
-        clf.partial_fit(b[np.newaxis], np.array([int(binary)], dtype=np.int64))
-        
+        clf.partial_fit(X, y)
+
         model_container[(source, lb)] = clf
+        last_loss = clf.history[-1]['train_loss'] if clf.history else float('nan')
+        print(f"Fit {source}/{lb}: {len(y)} samples, {pos_count} pos, {neg_count} neg, loss={last_loss:.4f}")
 
 def train(run, do_colony=True, do_clf=True):
     if do_colony:
@@ -228,8 +243,6 @@ def train(run, do_colony=True, do_clf=True):
         for meg, label_id, run_info in tqdm(run, desc="Training colonies", unit="window"):
             if i == 500:
                 break
-            
-            print(f"Digesting run {i}")
 
             word = run.id_to_word[int(label_id)]
             label = normalize_word(word)
@@ -244,24 +257,31 @@ def train(run, do_colony=True, do_clf=True):
                 print(f"Digested {i} samples...")
 
     if do_clf:
+        primary_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
+        moses_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
         i = 0
-        for meg, label_id, run_info in tqdm(run, desc="Training CLFs", unit="window"):
+        for meg, label_id, run_info in tqdm(run, desc="Collecting samples", unit="window"):
             if i == 500:
                 break
-            
-            print(f"Training on run {i}")
 
             word = run.id_to_word[int(label_id)]
             label = normalize_word(word)
             raw = create_raw(meg)
             if label in PRIMARY_VOCAB_TO_ID:
-                _train_clf(raw, primary_colonies_words, primary_band_clfs, label)
+                for k, v in _collect_sample(raw, primary_colonies_words, label).items():
+                    primary_buffers[k].append(v)
             if label in MOSES_VOCAB_TO_ID:
-                _train_clf(raw, moses_colonies_words, moses_band_clfs, label)
+                for k, v in _collect_sample(raw, moses_colonies_words, label).items():
+                    moses_buffers[k].append(v)
 
             i += 1
             if i % 100 == 0:
-                print(f"Trained {i} samples...")
+                print(f"Collected {i} samples...")
+
+        print("Fitting primary classifiers...")
+        _fit_clfs(primary_buffers, primary_band_clfs)
+        print("Fitting moses classifiers...")
+        _fit_clfs(moses_buffers, moses_band_clfs)
 
 def model(meg: np.ndarray):
     raw = create_raw(meg)
@@ -301,7 +321,8 @@ def model(meg: np.ndarray):
                     if colony is None:
                         continue
                     
-                    show_colony(colony, name=f"{source}_{band_name}_{word}")
+                    #if source == "inverse":
+                    #    show_colony(colony, name=f"{source}_{band_name}_{word}")
                     
                     weights = colony.pos_weights()
                     
@@ -386,6 +407,8 @@ def main():
         
         train(one_run)
         save_colony_state(f"pnpl/models/colony_run{i}.pt")
+        #load_colony_state("pnpl/models/colony_run0.pt")
+        print(dict(label_distribution))
         
         print(f"Finished training run {i}, saving and validating...")
         
