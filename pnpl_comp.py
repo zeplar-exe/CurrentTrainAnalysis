@@ -34,7 +34,7 @@ mne.set_log_level('ERROR')
 
 FIF = "~/.cache/huggingface/hub/datasets--pnpl--LibriBrain/snapshots/5a7c332b34fc7be329c4df3e527a41f67bfd878f/Sherlock1/sub-0/ses-1/meg/sub-0_ses-1_task-Sherlock1_run-1_meg.fif"
 
-TMIN, TMAX = 0.0, 0.4 # 1.0
+TMIN, TMAX = 0.0, 0.45 # 1.0
 DATA_PATH = Path(".") / "pnpl" / "libribrain_word"
 TRAIN_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(1, 7 + 1)]   # sessions 1-7
 VALIDATION_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(8, 9 + 1)]   # sessions 8-9
@@ -186,12 +186,15 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
 
             if weights.ndim == 1:
                 weights = weights[np.newaxis]
-            win_samples = int(MULTICOLONY_STEP * SFREQ)
+            spans = []
             for wi, row in enumerate(weights):
+                t0 = round(wi * MULTICOLONY_STEP * SFREQ)
+                t1 = min(round((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1])
+                if t0 >= t1:
+                    break
                 top = np.where(row >= np.quantile(row, PERCENTILE))[0]
-                t0 = wi * win_samples
-                t1 = min(t0 + win_samples, src.shape[1])
-                b.append(src[top, t0:t1])
+                spans.append(src[top, t0:t1])
+            b.append(np.concatenate(spans, axis=1))
 
         result[(source, lb)] = (np.concatenate(b), binary)
     return result
@@ -215,7 +218,22 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
                                 device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
         clf.criterion__weight = torch.tensor([neg_w, pos_w], dtype=torch.float32)
+
+        device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
+        if hasattr(clf, 'module_'):
+            clf.module_.to(device)
+            for st in clf.optimizer_.state.values():
+                for k, v in st.items():
+                    if torch.is_tensor(v):
+                        st[k] = v.to(device)
         clf.partial_fit(X, y)
+        clf.module_.to('cpu')
+        for st in clf.optimizer_.state.values():
+            for k, v in st.items():
+                if torch.is_tensor(v):
+                    st[k] = v.to('cpu')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         model_container[(source, lb)] = clf
         last_loss = clf.history[-1]['train_loss'] if clf.history else float('nan')
@@ -326,18 +344,26 @@ def model(meg: np.ndarray):
                     
                     if weights.ndim == 1:
                         weights = weights[np.newaxis]
-                    win_samples = int(MULTICOLONY_STEP * SFREQ)
+                    src = band_data[band_name][source]
+                    spans = []
                     for wi, row in enumerate(weights):
+                        t0 = round(wi * MULTICOLONY_STEP * SFREQ)
+                        t1 = min(round((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1])
+                        if t0 >= t1:
+                            break
                         top = np.where(row >= np.quantile(row, PERCENTILE))[0]
-                        src = band_data[band_name][source]
-                        t0 = wi * win_samples
-                        t1 = min(t0 + win_samples, src.shape[1])
-                        channels.append(src[top, t0:t1])
+                        spans.append(src[top, t0:t1])
+                    channels.append(np.concatenate(spans, axis=1))
                 
                 if not channels:
                     continue
                 
-                prob[word] += clfs[k].predict_proba(np.concatenate(channels)[np.newaxis])[0, 1]
+                clf = clfs[k]
+                clf.module_.to(clf.device)
+                prob[word] += clf.predict_proba(np.concatenate(channels)[np.newaxis])[0, 1]
+                clf.module_.to('cpu')
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     primary_list = [0.0] * 50
     moses_list = [0.0] * 50
