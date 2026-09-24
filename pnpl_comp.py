@@ -94,19 +94,22 @@ label_distribution: dict[str, int] = defaultdict(int)
 class WordCNN(nn.Module):
     def __init__(self, n_channels):
         super().__init__()
+        # scale width to the input: vol is ~40 channels, inverse is ~2500
+        w1 = int(np.clip(n_channels // 4, 32, 512))
+        w2 = max(w1 // 2, 16)
         self.net = nn.Sequential(
-            nn.Conv1d(n_channels, 512, kernel_size=5, padding=2),
-            nn.BatchNorm1d(512),
+            nn.Conv1d(n_channels, w1, kernel_size=5, padding=2),
+            nn.BatchNorm1d(w1),
             nn.ReLU(),
-            nn.Conv1d(512, 512, kernel_size=5, padding=2),
-            nn.BatchNorm1d(512),
+            nn.Conv1d(w1, w1, kernel_size=5, padding=2),
+            nn.BatchNorm1d(w1),
             nn.ReLU(),
-            nn.Conv1d(512, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
+            nn.Conv1d(w1, w2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(w2),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
-            nn.Linear(256, 2),
+            nn.Linear(w2, 2),
         )
 
     def forward(self, X):
@@ -157,7 +160,7 @@ def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], M
         high = min(band["high"], SFREQ / 2.0 - 1)
 
         raw_filtered = raw.copy()
-        raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4, verbose='error')
+        raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
 
         new_colonies = compute_gain(prepared_inv, raw_filtered,
             lambda2, TIMESTEP, MULTICOLONY_STEP, None, 
@@ -200,7 +203,7 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
     return result
 
 
-def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], model_container: dict[tuple[str, str], NeuralNetClassifier], epochs=20, batch_size=32):
+def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], model_container: dict[tuple[str, str], NeuralNetClassifier], epochs=50, batch_size=32):
     for (source, lb), samples in buffers.items():
         X = np.stack([s[0] for s in samples])
         y = np.array([s[1] for s in samples], dtype=np.int64)
@@ -275,7 +278,7 @@ def train(run, do_colony=True, do_clf=True):
                 low = band["low"]
                 high = min(band["high"], SFREQ / 2.0 - 1)
                 raw_filtered = raw.copy()
-                raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4, verbose='error')
+                raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
                 band_data[band_name] = {
                     "vol": raw_filtered.get_data().astype(np.float32),
                     "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
@@ -307,7 +310,7 @@ def model(meg: np.ndarray):
         low = band["low"]
         high = min(band["high"], SFREQ / 2.0 - 1)
         raw_filtered = raw.copy()
-        raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4, verbose='error')
+        raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
         band_data[band_name] = {
             "vol": raw_filtered.get_data().astype(np.float32),
             "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
