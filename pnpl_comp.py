@@ -171,7 +171,7 @@ def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], M
             else:
                 colony_container[k] = new_colony
 
-def _collect_sample(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], label: str) -> dict[tuple[str, str], tuple[np.ndarray, int]]:
+def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_container: dict[tuple[str, str, str], MultiColony], label: str) -> dict[tuple[str, str], tuple[np.ndarray, int]]:
     label_distribution[label] += 1
     result = {}
 
@@ -182,23 +182,7 @@ def _collect_sample(raw: mne.io.RawArray, colony_container: dict[tuple[str, str,
 
         for (_, band_name, _), colony in group:
             weights = colony.pos_weights()
-
-            band = TARGET_BANDS[band_name]
-            low = band["low"]
-            high = min(band["high"], SFREQ / 2.0 - 1)
-
-            raw_filtered = raw.copy()
-            raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4, verbose='error')
-
-            if source == "vol":
-                src = raw_filtered.get_data().astype(np.float32)
-            elif source == "inverse":
-                src = apply_inverse_raw(raw_filtered, prepared_inv,
-                    lambda2=lambda2,
-                    method="dSPM", prepared=True,
-                    verbose="error").data.astype(np.float32)
-            else:
-                raise ValueError(f"Unhandled source: {source}")
+            src = band_data[band_name][source]
 
             if weights.ndim == 1:
                 weights = weights[np.newaxis]
@@ -226,7 +210,7 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
         n_channels = X.shape[1]
 
         clf = model_container.get((source, lb)) or \
-            NeuralNetClassifier(WordCNN(n_channels), max_epochs=epochs, lr=0.1, batch_size=batch_size, train_split=None, verbose=0,
+            NeuralNetClassifier(WordCNN(n_channels), max_epochs=epochs, lr=0.001, batch_size=batch_size, train_split=None, verbose=0,
                                 criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
                                 device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
@@ -267,11 +251,25 @@ def train(run, do_colony=True, do_clf=True):
             word = run.id_to_word[int(label_id)]
             label = normalize_word(word)
             raw = create_raw(meg)
+
+            band_data = {}
+            for band_name, band in TARGET_BANDS.items():
+                low = band["low"]
+                high = min(band["high"], SFREQ / 2.0 - 1)
+                raw_filtered = raw.copy()
+                raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=4, verbose='error')
+                band_data[band_name] = {
+                    "vol": raw_filtered.get_data().astype(np.float32),
+                    "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
+                        lambda2=lambda2, method="dSPM", prepared=True,
+                        verbose="error").data.astype(np.float32),
+                }
+
             if label in PRIMARY_VOCAB_TO_ID:
-                for k, v in _collect_sample(raw, primary_colonies_words, label).items():
+                for k, v in _collect_sample(band_data, primary_colonies_words, label).items():
                     primary_buffers[k].append(v)
             if label in MOSES_VOCAB_TO_ID:
-                for k, v in _collect_sample(raw, moses_colonies_words, label).items():
+                for k, v in _collect_sample(band_data, moses_colonies_words, label).items():
                     moses_buffers[k].append(v)
 
             i += 1
@@ -406,11 +404,11 @@ def main():
         )
         
         train(one_run)
+        print(f"Finished training run {i}, saving and validating...")
         save_colony_state(f"pnpl/models/colony_run{i}.pt")
         #load_colony_state("pnpl/models/colony_run0.pt")
-        print(dict(label_distribution))
+        print("\tCurrent Label Distribution:", dict(label_distribution))
         
-        print(f"Finished training run {i}, saving and validating...")
         
         for j, run in enumerate(VALIDATION_RUNS):
             one_run = LibriBrainWord(
