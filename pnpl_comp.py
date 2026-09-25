@@ -187,8 +187,6 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
         b = []
 
         for (_, band_name, _), colony in group:
-            if source == "inverse":
-                show_colony(colony, name=f"{source}_{band_name}_{lb}", output=f"./pnpl/colonies/{source}_{band_name}_{lb}.html")
             weights = colony.pos_weights()
             src = band_data[band_name][source]
 
@@ -260,7 +258,13 @@ def train(run, do_colony=True, do_clf=True):
             i += 1
             if i % 100 == 0:
                 print(f"Digested {i} samples...")
-
+        
+        for (source, band, label), colony in primary_colonies_words.items():
+            if source == "inverse":
+                show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/primary-{source}_{band}_{label}.html")
+        for (source, band, label), colony in primary_colonies_words.items():
+            if source == "inverse":
+                show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/moses-{source}_{band}_{label}.html")
     if do_clf:
         primary_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
         moses_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
