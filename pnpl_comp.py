@@ -7,10 +7,8 @@ import numpy as np
 from pnpl.competition import LibriBrainCompetitionHoldout, write_submission
 import sys
 from pathlib import Path
-from mne.datasets import sample
 import mne
 import torch
-import os
 from heapq import nlargest
 from pnpl.datasets import LibriBrainWord
 from pnpl.competition import load_vocabulary
@@ -22,6 +20,7 @@ import mne
 from pathlib import Path
 import warnings
 from skorch import NeuralNetClassifier
+from pnpl_word_durations import word_sd_duration, word_mean_duration
 import torch.nn as nn
 
 warnings.filterwarnings(
@@ -154,6 +153,9 @@ def load_colony_state(f: str | Path = MODEL_STATE_PATH):
 
     return state
 
+def label_duration(label: str):
+    return word_mean_duration(label, default=0.45) + 2*word_sd_duration(label, default=0.0)
+
 def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], label: str):
     for band_name, band in TARGET_BANDS.items():
         low = band["low"]
@@ -161,6 +163,7 @@ def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], M
 
         raw_filtered = raw.copy()
         raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
+        raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
 
         new_colonies = compute_gain(prepared_inv, raw_filtered,
             lambda2, TIMESTEP, MULTICOLONY_STEP, None, 
@@ -184,7 +187,8 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
         b = []
 
         for (_, band_name, _), colony in group:
-            show_colony(colony, name=f"{source}_{band_name}_{lb}", output=f"./pnpl/colonies/{source}_{band_name}_{lb}.html")
+            if source == "inverse":
+                show_colony(colony, name=f"{source}_{band_name}_{lb}", output=f"./pnpl/colonies/{source}_{band_name}_{lb}.html")
             weights = colony.pos_weights()
             src = band_data[band_name][source]
 
@@ -246,7 +250,7 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
 def train(run, do_colony=True, do_clf=True):
     if do_colony:
         i = 0
-        for meg, label in tqdm(run, desc="Training colonies", unit="window"):
+        for meg, label in tqdm(run, desc="Feeding colonies", unit="window"):
             raw = create_raw(meg)
             if label in PRIMARY_VOCAB_TO_ID:
                 _digest(raw, primary_colonies_words, label)
@@ -270,6 +274,7 @@ def train(run, do_colony=True, do_clf=True):
                 high = min(band["high"], SFREQ / 2.0 - 1)
                 raw_filtered = raw.copy()
                 raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
+                raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
                 band_data[band_name] = {
                     "vol": raw_filtered.get_data().astype(np.float32),
                     "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
@@ -331,9 +336,6 @@ def model(meg: np.ndarray):
                     if colony is None:
                         continue
                     
-                    #if source == "inverse":
-                    #    show_colony(colony, name=f"{source}_{band_name}_{word}")
-                    
                     weights = colony.pos_weights()
                     
                     if weights.ndim == 1:
@@ -342,7 +344,7 @@ def model(meg: np.ndarray):
                     spans = []
                     for wi, row in enumerate(weights):
                         t0 = round(wi * MULTICOLONY_STEP * SFREQ)
-                        t1 = min(round((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1])
+                        t1 = min(round((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1], label_duration(word) * SFREQ)
                         if t0 >= t1:
                             break
                         top = np.where(row >= np.quantile(row, PERCENTILE))[0]
