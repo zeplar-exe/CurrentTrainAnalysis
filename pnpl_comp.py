@@ -280,7 +280,7 @@ def train(run, do_colony=True, do_clf=True):
                 raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
                 raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
                 band_data[band_name] = {
-                    "vol": raw_filtered.get_data().astype(np.float32),
+                    "vol": raw_filtered.get_data().astype(np.float32), 
                     "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
                         lambda2=lambda2, method="dSPM", prepared=True,
                         verbose="error").data.astype(np.float32),
@@ -348,7 +348,8 @@ def model(meg: np.ndarray):
                     spans = []
                     for wi, row in enumerate(weights):
                         t0 = round(wi * MULTICOLONY_STEP * SFREQ)
-                        t1 = min(round((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1], label_duration(word) * SFREQ)
+                        # according to Claude, MNE's crop is int(T * SFREQ) + 1, to do with include_max, tbd
+                        t1 = min(int((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1], int(label_duration(word) * SFREQ) + 1)
                         if t0 >= t1:
                             break
                         top = np.where(row >= np.quantile(row, PERCENTILE))[0]

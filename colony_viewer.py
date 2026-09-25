@@ -75,34 +75,56 @@ def get_montage_positions():
     return pos_2d
 
 
-def make_3d_traces(df, name):
-    p75 = df.value.quantile(0.75)
-    p85 = df.value.quantile(0.85)
-    p90 = df.value.quantile(0.90)
-    p95 = df.value.quantile(0.95)
+# linear ramp across the top quartile, replacing the old discrete tiers
+GRADIENT_QUANTILE = 0.75
+GRADIENT_COLORSCALE = [
+    [0.00, "#a3e635"],
+    [0.33, "#eab308"],
+    [0.67, "#ea580c"],
+    [1.00, "#dc2626"],
+]
 
-    rest   = df[df.value < p75]
-    top_25 = df[(df.value >= p75) & (df.value < p85)]
-    top_15 = df[(df.value >= p85) & (df.value < p90)]
-    top_10 = df[(df.value >= p90) & (df.value < p95)]
-    top_5  = df[df.value >= p95]
+
+def _gradient_sizes(vals, lo, hi, smin, smax):
+    """Linear marker sizes over [lo, hi]; flat at smax if the range degenerates."""
+    if hi <= lo:
+        return np.full(len(vals), smax)
+    t = np.clip((np.asarray(vals, dtype=float) - lo) / (hi - lo), 0.0, 1.0)
+    return smin + t * (smax - smin)
+
+
+def make_3d_traces(df, name):
+    lo = df.value.quantile(GRADIENT_QUANTILE)
+    hi = df.value.max()
+
+    rest = df[df.value < lo]
+    top = df[df.value >= lo]
 
     hover = "x:%{x:.1f} y:%{y:.1f} z:%{z:.1f}<br>value:%{customdata:.3f}<extra></extra>"
 
-    traces = []
-    for subset, size, color, opacity, label in [
-        (rest,   2, "#9ca3af", 0.15, f"{name} <75% (< {p75:.2f})"),
-        (top_25, 2.5, "#a3e635", 0.40, f"{name} top 15-25% ({p75:.2f}-{p85:.2f})"),
-        (top_15, 3, "#eab308", 0.70, f"{name} top 10-15% ({p85:.2f}-{p90:.2f})"),
-        (top_10, 4, "#ea580c", 0.85, f"{name} top 5-10% ({p90:.2f}-{p95:.2f})"),
-        (top_5,  5, "#dc2626", 0.95, f"{name} top 5% (> {p95:.2f})"),
-    ]:
+    traces = [go.Scatter3d(
+        x=rest.x, y=rest.y, z=rest.z,
+        mode="markers",
+        marker=dict(size=2, color="#9ca3af", opacity=0.15),
+        customdata=rest.value,
+        name=f"{name} <75% (< {lo:.2f})",
+        hovertemplate=hover,
+    )]
+
+    if not top.empty:
         traces.append(go.Scatter3d(
-            x=subset.x, y=subset.y, z=subset.z,
+            x=top.x, y=top.y, z=top.z,
             mode="markers",
-            marker=dict(size=size, color=color, opacity=opacity),
-            customdata=subset.value,
-            name=label,
+            marker=dict(
+                size=_gradient_sizes(top.value, lo, hi, 2.5, 5),
+                color=top.value,
+                colorscale=GRADIENT_COLORSCALE,
+                cmin=lo, cmax=hi,
+                opacity=0.9,
+                colorbar=dict(title=f"{name}<br>top 25%", thickness=12, len=0.6),
+            ),
+            customdata=top.value,
+            name=f"{name} top 25% ({lo:.2f}-{hi:.2f})",
             hovertemplate=hover,
         ))
     return traces
@@ -122,26 +144,18 @@ def make_2d_traces(df, name, montage_pos):
     labels = matched["electrode"].values
 
     p50 = np.quantile(vals, 0.50)
-    p75 = np.quantile(vals, 0.75)
-    p85 = np.quantile(vals, 0.85)
-    p90 = np.quantile(vals, 0.90)
-    p95 = np.quantile(vals, 0.95)
+    lo = np.quantile(vals, GRADIENT_QUANTILE)
+    hi = vals.max()
 
     xs = np.array(xs)
     ys = np.array(ys)
 
-    tiers = [
-        (vals < p50,                    6,  "#d1d5db", 0.3,  f"{name} <50% (< {p50:.2f})"),
-        ((vals >= p50) & (vals < p75),  8,  "#9ca3af", 0.5,  f"{name} top 25-50% ({p50:.2f}-{p75:.2f})"),
-        ((vals >= p75) & (vals < p85), 10, "#a3e635", 0.7,  f"{name} top 15-25% ({p75:.2f}-{p85:.2f})"),
-        ((vals >= p85) & (vals < p90), 13, "#eab308", 0.8,  f"{name} top 10-15% ({p85:.2f}-{p90:.2f})"),
-        ((vals >= p90) & (vals < p95), 16, "#ea580c", 0.9,  f"{name} top 5-10% ({p90:.2f}-{p95:.2f})"),
-        (vals >= p95,                  20, "#dc2626", 1.0,  f"{name} top 5% (> {p95:.2f})"),
-    ]
-
     hover = "%{text}<br>value:%{customdata:.3f}<extra></extra>"
     traces = []
-    for mask, size, color, opacity, label in tiers:
+    for mask, size, color, opacity, label in [
+        (vals < p50,                   6, "#d1d5db", 0.3, f"{name} <50% (< {p50:.2f})"),
+        ((vals >= p50) & (vals < lo),  8, "#9ca3af", 0.5, f"{name} top 25-50% ({p50:.2f}-{lo:.2f})"),
+    ]:
         if not mask.any():
             continue
         traces.append(go.Scatter(
@@ -153,6 +167,26 @@ def make_2d_traces(df, name, montage_pos):
             textfont=dict(size=7),
             customdata=vals[mask],
             name=label,
+            hovertemplate=hover,
+        ))
+
+    top = vals >= lo
+    if top.any():
+        traces.append(go.Scatter(
+            x=xs[top], y=ys[top],
+            mode="markers+text",
+            marker=dict(
+                size=_gradient_sizes(vals[top], lo, hi, 10, 20),
+                color=vals[top],
+                colorscale=GRADIENT_COLORSCALE,
+                cmin=lo, cmax=hi,
+                colorbar=dict(title=f"{name}<br>top 25%", thickness=12, len=0.6),
+            ),
+            text=labels[top],
+            textposition="top center",
+            textfont=dict(size=7),
+            customdata=vals[top],
+            name=f"{name} top 25% ({lo:.2f}-{hi:.2f})",
             hovertemplate=hover,
         ))
     return traces

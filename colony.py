@@ -563,10 +563,10 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # can retrain with training data weighted perhaps? 
 # The comparison to Fisher-score selection or anatomical selection on the same decoders is a result
     # any others I should know about for testing?
-# consider: this is a binary encoder for 1 singular type of event, though it can be expended to multi-event
-    # as in: give epochs of multiple events, so you know what electrodes are generally shared and active
-# any good classifier with this should give a probability for the given event to occur
-    # we can do a multi-class probability decoder with this via combination of multiple binary classifiers, one per event
+# + consider: this is a binary encoder for 1 singular type of event, though it can be expended to multi-event
+    # + as in: give epochs of multiple events, so you know what electrodes are generally shared and active
+# + any good classifier with this should give a probability for the given event to occur
+    # + we can do a multi-class probability decoder with this via combination of multiple binary classifiers, one per event
 
 # WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
     # https://www.nature.com/articles/s41598-022-15252-0
@@ -574,7 +574,7 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 # also: let's just find the 32, 64, 128 datasets we want to use so we're not limited to MI
     # + refactor _read_csv_record to be eegmmidb-specific (remove the glob in the spec and put it here)
 # + ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
-# how do we choose when to mirror and when not to mirror during colony growth?
+# - how do we choose when to mirror and when not to mirror during colony growth?
 # + HEY HEY: what if we mapped the grasplift events to be 100ms earlier? since we're catching unwanted occipital data
 # ALSO ALSO: it would be nice to use the eye dataset after all since it's fully self contained events (blinks, saccades, fixations)
 # ALSO ALSO: we ought to update colony_path.py to use the raw data instead of the windows cause windows of growth aren't useful?? I think, but I'm tired
@@ -586,13 +586,14 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
     # - cause: inverse handles spatial densities; CSD handles dipoles and provides another form of localization
     # + for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
 # + HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
-# after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
+# + after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
 
-# also also, we should probably do the mirroring for csd and raw too
+# - also also, we should probably do the mirroring for csd and raw too
 
 # what about the path idea by the way?
     # we can do a 2nd pass using the top n% vertices and then go through every window and get the average activations temporally
-# also also, when we have more events, we should cut out the broadband noise that appears in every single one to see if accuracy can improve without cutting the truly valuable electrodes
+# - also also, when we have more events, we should cut out the broadband noise that appears in every single one to see if accuracy can improve without cutting the truly valuable electrodes
+    # / what?
 
 
 # anywho: a second report is on the amount of vertex overlap (top 5, 15, 25, 50 vertices) per-event within and across subjects and bands
@@ -624,7 +625,8 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
 # - The tail ratio: what fraction of total variance/power is carried by the top 10%, 25%, 50% of vertices?
     # / variance is noise
 # Gini coefficient: measures concentration. 0 = perfectly uniform (every vertex equal), 1 = all value in one vertex.
-# get % of the total gain across all electrodes/vertices is handled by per percentile
+# - get % of the total gain across all electrodes/vertices is handled by per percentile
+    # / will be very low
 
 # we can include some of the coalesced colonies
     # for ex: (for alpha) show that the inverses of the hand grip events are massively red in the frontal cortex while the CSD show contralateralization
