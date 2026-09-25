@@ -184,6 +184,7 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
         b = []
 
         for (_, band_name, _), colony in group:
+            show_colony(colony, name=f"{source}_{band_name}_{lb}", output=f"./pnpl/colonies/{source}_{band_name}_{lb}.html")
             weights = colony.pos_weights()
             src = band_data[band_name][source]
 
@@ -245,12 +246,7 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
 def train(run, do_colony=True, do_clf=True):
     if do_colony:
         i = 0
-        for meg, label_id, run_info in tqdm(run, desc="Training colonies", unit="window"):
-            if i == 500:
-                break
-
-            word = run.id_to_word[int(label_id)]
-            label = normalize_word(word)
+        for meg, label in tqdm(run, desc="Training colonies", unit="window"):
             raw = create_raw(meg)
             if label in PRIMARY_VOCAB_TO_ID:
                 _digest(raw, primary_colonies_words, label)
@@ -265,12 +261,7 @@ def train(run, do_colony=True, do_clf=True):
         primary_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
         moses_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
         i = 0
-        for meg, label_id, run_info in tqdm(run, desc="Collecting samples", unit="window"):
-            if i == 500:
-                break
-
-            word = run.id_to_word[int(label_id)]
-            label = normalize_word(word)
+        for meg, label in tqdm(run, desc="Collecting samples", unit="window"):
             raw = create_raw(meg)
 
             band_data = {}
@@ -396,8 +387,6 @@ def validate(run):
             print(f"Validating {n_val}... {success}/{total} ({success/total*100:.1f}%)" if total else f"Validating {n_val}...")
 
         _, _, p, m = model(meg)
-        print("Primary", p)
-        print("Moses", m)
         all_p = nlargest(50, p, key=p.get)
         all_m = nlargest(50, m, key=m.get)
         top_p = nlargest(10, p, key=p.get)
@@ -405,14 +394,14 @@ def validate(run):
         
         if label in PRIMARY_VOCAB_TO_ID:
             if label in top_p:
-                print(f"\tPositive-Primary: '{label}' is in top 10 ({top_p.index(label) + 1}th)")
+                print(f"\tPositive-Primary: '{label}' IS in top 10 ({top_p.index(label) + 1}th)")
                 success += 1
             else:
                 print(f"\tNegative-Primary: '{label}' is NOT in top 10 ({all_p.index(label) + 1}th)")
                 fail += 1
         if label in MOSES_VOCAB_TO_ID:
             if label in top_m:
-                print(f"\tPositive-Moses: '{label}' is in top 10 ({top_m.index(label) + 1}th)")
+                print(f"\tPositive-Moses: '{label}' IS in top 10 ({top_m.index(label) + 1}th)")
                 success += 1
             else:
                 print(f"\tNegative-Moses: '{label}' is NOT in top 10 ({all_m.index(label) + 1}th)")
@@ -450,6 +439,9 @@ def main():
                 preload_files=False,   # download lazily instead of all-at-once
             )
             
+            one_run = [(r[0], normalize_word(one_run.id_to_word(r[1]))) for r in one_run]
+            one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
+            
             validate(one_run)
 
     for i, run in enumerate(TEST_RUNS):
@@ -462,6 +454,9 @@ def main():
             include_info=True,     # also return a dict with the word string, onset, etc.
             preload_files=False,   # download lazily instead of all-at-once
         )
+        
+        one_run = [(r[0], normalize_word(one_run.id_to_word(r[1]))) for r in one_run]
+        one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
         
         validate(one_run)
 
