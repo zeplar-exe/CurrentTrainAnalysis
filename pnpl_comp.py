@@ -374,7 +374,7 @@ def validate(run):
     fail = 0
 
     n_val = 0
-    for meg, label_id in tqdm(run, desc="Validating", unit="window"):
+    for meg, label in tqdm(run, desc="Validating", unit="window"):
         n_val += 1
         if n_val % 50 == 0:
             total = success + fail
@@ -416,7 +416,7 @@ def main():
         )
         
         one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
-        one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
+        one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
         
         train(one_run)
         print(f"Finished training run {i}, saving and validating...")
@@ -437,7 +437,7 @@ def main():
             )
             
             one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
-            one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
+            one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
             
             validate(one_run)
 
@@ -453,7 +453,7 @@ def main():
         )
         
         one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
-        one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
+        one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
         
         validate(one_run)
 
