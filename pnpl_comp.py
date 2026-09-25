@@ -374,13 +374,7 @@ def validate(run):
     fail = 0
 
     n_val = 0
-    for meg, label_id, run_info in tqdm(run, desc="Validating", unit="window"):
-        word = run.id_to_word[int(label_id)]
-        label = normalize_word(word)
-
-        if label not in PRIMARY_VOCAB_TO_ID and label not in MOSES_VOCAB_TO_ID:
-            continue
-
+    for meg, label_id in tqdm(run, desc="Validating", unit="window"):
         n_val += 1
         if n_val % 50 == 0:
             total = success + fail
@@ -420,6 +414,9 @@ def main():
             include_info=True,     # also return a dict with the word string, onset, etc.
             preload_files=False,   # download lazily instead of all-at-once
         )
+        
+        one_run = [(r[0], normalize_word(one_run.id_to_word(r[1]))) for r in one_run]
+        one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
         
         train(one_run)
         print(f"Finished training run {i}, saving and validating...")
