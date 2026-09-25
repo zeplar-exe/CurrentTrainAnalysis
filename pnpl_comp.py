@@ -415,7 +415,7 @@ def main():
             preload_files=False,   # download lazily instead of all-at-once
         )
         
-        one_run = [(r[0], normalize_word(one_run.id_to_word(r[1]))) for r in one_run]
+        one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
         one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
         
         train(one_run)
@@ -436,7 +436,7 @@ def main():
                 preload_files=False,   # download lazily instead of all-at-once
             )
             
-            one_run = [(r[0], normalize_word(one_run.id_to_word(r[1]))) for r in one_run]
+            one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
             one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
             
             validate(one_run)
@@ -452,7 +452,7 @@ def main():
             preload_files=False,   # download lazily instead of all-at-once
         )
         
-        one_run = [(r[0], normalize_word(one_run.id_to_word(r[1]))) for r in one_run]
+        one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
         one_run = [r for r in one_run if r in PRIMARY_VOCAB_TO_ID or r in MOSES_VOCAB_TO_ID]
         
         validate(one_run)
