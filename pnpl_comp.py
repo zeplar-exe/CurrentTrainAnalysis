@@ -33,7 +33,7 @@ mne.set_log_level('ERROR')
 
 FIF = "~/.cache/huggingface/hub/datasets--pnpl--LibriBrain/snapshots/5a7c332b34fc7be329c4df3e527a41f67bfd878f/Sherlock1/sub-0/ses-1/meg/sub-0_ses-1_task-Sherlock1_run-1_meg.fif"
 
-TMIN, TMAX = 0.0, 0.45 # 1.0
+TMIN, TMAX = 0.0, 1.0
 DATA_PATH = Path(".") / "pnpl" / "libribrain_word"
 TRAIN_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(1, 7 + 1)]   # sessions 1-7
 VALIDATION_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(8, 9 + 1)]   # sessions 8-9
