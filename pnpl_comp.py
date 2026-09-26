@@ -1,6 +1,8 @@
+import argparse
 from collections import defaultdict
 from itertools import groupby, batched
 import pickle
+import re
 
 from mne.minimum_norm import apply_inverse_raw, prepare_inverse_operator
 import numpy as np
@@ -391,9 +393,12 @@ def model(meg: np.ndarray):
 
     return primary_list, moses_list, primary_prob, moses_prob
 
-def validate(run):    
+def validate(run, scores_path=None):
     success = 0
     fail = 0
+
+    # full score spectra, one row per window, columns in vocab-id order
+    all_primary, all_moses, labels = [], [], []
 
     n_val = 0
     for meg, label in tqdm(run, desc="Validating", unit="window"):
@@ -402,7 +407,10 @@ def validate(run):
             total = success + fail
             print(f"Validating {n_val}... {success}/{total} ({success/total*100:.1f}%)" if total else f"Validating {n_val}...")
 
-        _, _, p, m = model(meg)
+        primary_list, moses_list, p, m = model(meg)
+        all_primary.append(primary_list)
+        all_moses.append(moses_list)
+        labels.append(label)
         all_p = nlargest(50, p, key=p.get)
         all_m = nlargest(50, m, key=m.get)
         top_p = nlargest(10, p, key=p.get)
@@ -425,8 +433,37 @@ def validate(run):
     
     print(f"Validation: {success} successes, {fail} failures ({success / (success + fail) * 100:.2f}% accuracy)")
 
+    if scores_path is not None:
+        scores_path = Path(scores_path)
+        scores_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            scores_path,
+            primary=np.array(all_primary, dtype=np.float32),
+            moses=np.array(all_moses, dtype=np.float32),
+            label=np.array(labels),
+            primary_vocab=np.array([PRIMARY_ID_TO_VOCAB[i] for i in range(len(PRIMARY_ID_TO_VOCAB))]),
+            moses_vocab=np.array([MOSES_ID_TO_VOCAB[i] for i in range(len(MOSES_ID_TO_VOCAB))]),
+            train_words=np.array(list(label_distribution.keys())),
+            train_counts=np.array(list(label_distribution.values()), dtype=np.int64),
+        )
+        print(f"Saved score spectra to {scores_path}")
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="saved state to resume from, e.g. pnpl/models/colony_run2.pt")
+    args = parser.parse_args()
+
+    start = 0
+    if args.resume is not None:
+        load_colony_state(args.resume)
+        m = re.search(r"colony_run(\d+)", args.resume.stem)
+        start = int(m.group(1)) + 1 if m else 0
+        print(f"Resumed from {args.resume}, starting at training run {start}")
+
     for i, run_key in enumerate(TRAIN_RUNS):
+        if i < start:
+            continue
         one_run = LibriBrainWord(
             data_path=str(DATA_PATH),
             include_run_keys=[run_key],
@@ -440,10 +477,10 @@ def main():
         one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
         one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
         
+        print("\tCurrent Label Distribution:", dict(label_distribution))
         train(one_run)
         print(f"Finished training run {i}, saving and validating...")
         save_colony_state(f"pnpl/models/colony_run{i}.pt")
-        #load_colony_state("pnpl/models/colony_run0.pt")
         print("\tCurrent Label Distribution:", dict(label_distribution))
         
         
@@ -461,7 +498,7 @@ def main():
             one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
             one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
             
-            validate(one_run)
+            validate(one_run, f"pnpl/scores/after_run{i}_val_ses{run[1]}.npz")
 
     for i, run in enumerate(TEST_RUNS):
         one_run = LibriBrainWord(
@@ -477,7 +514,7 @@ def main():
         one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
         one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
         
-        validate(one_run)
+        validate(one_run, f"pnpl/scores/test_ses{run[1]}.npz")
 
 if __name__ == "__main__":
     main()
