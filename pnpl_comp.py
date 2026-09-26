@@ -96,8 +96,11 @@ class WordCNN(nn.Module):
         # scale width to the input: vol is ~40 channels, inverse is ~2500
         w1 = int(np.clip(n_channels // 4, 32, 512))
         w2 = max(w1 // 2, 16)
+        n_spatial = min(n_channels, 128)
         self.net = nn.Sequential(
-            nn.Conv1d(n_channels, w1, kernel_size=5, padding=2),
+            nn.Conv1d(n_channels, n_spatial, kernel_size=1, bias=False),
+            nn.BatchNorm1d(n_spatial),
+            nn.Conv1d(n_spatial, w1, kernel_size=5, padding=2),
             nn.BatchNorm1d(w1),
             nn.ReLU(),
             nn.Conv1d(w1, w1, kernel_size=5, padding=2),
