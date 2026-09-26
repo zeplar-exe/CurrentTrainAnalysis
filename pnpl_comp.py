@@ -223,7 +223,10 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
                                 criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
                                 device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
 
-        clf.criterion__weight = torch.tensor([neg_w, pos_w], dtype=torch.float32)
+        if pos_count == 0 or neg_count == 0:
+            clf.criterion__weight = None # unweighted: negatives count fully
+        else:
+            clf.criterion__weight = torch.tensor([neg_w, pos_w], dtype=torch.float32)
 
         device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
         if hasattr(clf, 'module_'):
