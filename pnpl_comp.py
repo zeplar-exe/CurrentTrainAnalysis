@@ -156,6 +156,18 @@ def load_colony_state(f: str | Path = MODEL_STATE_PATH):
 def label_duration(label: str):
     return word_mean_duration(label, default=0.45) + 2*word_sd_duration(label, default=0.0)
 
+def pad_or_truncate(x, length, axis=-1, value=0.0):
+    n = x.shape[axis]
+    if n == length:
+        return x
+    if n > length:
+        sl = [slice(None)] * x.ndim
+        sl[axis] = slice(0, length)
+        return x[tuple(sl)]
+    pad = [(0, 0)] * x.ndim
+    pad[axis] = (0, length - n)
+    return np.pad(x, pad, constant_values=value)
+
 def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], label: str):
     for band_name, band in TARGET_BANDS.items():
         low = band["low"]
@@ -208,7 +220,8 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
 
 def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], model_container: dict[tuple[str, str], NeuralNetClassifier], epochs=50, batch_size=32):
     for (source, lb), samples in buffers.items():
-        X = np.stack([s[0] for s in samples])
+        lb_dur_index = int(label_duration(lb) * SFREQ) + 1
+        X = np.stack([pad_or_truncate(s[0], lb_dur_index) for s in samples])
         y = np.array([s[1] for s in samples], dtype=np.int64)
 
         pos_count = y.sum()
@@ -352,7 +365,8 @@ def model(meg: np.ndarray):
                             break
                         top = np.where(row >= np.quantile(row, PERCENTILE))[0]
                         spans.append(src[top, t0:t1])
-                    channels.append(np.concatenate(spans, axis=1))
+                    lb_dur_index = int(label_duration(word) * SFREQ) + 1
+                    channels.append(pad_or_truncate(np.concatenate(spans, axis=1), lb_dur_index))
                 
                 if not channels:
                     continue
