@@ -1,4 +1,5 @@
 import argparse
+import json
 from collections import defaultdict
 from itertools import groupby, batched
 import pickle
@@ -62,6 +63,10 @@ del TARGET_BANDS["standard"]
 
 PERCENTILE = 0.975
 
+# classifier inputs are (band, stage, vertex, sample): one block per multicolony stage
+STAGE_LEN = int(MULTICOLONY_STEP * SFREQ)
+CLASSIFIER = "stage"
+
 MODEL_STATE_PATH = Path("./pnpl/model_state.pkl")
 
 info_fif = mne.io.read_info(FIF)
@@ -120,6 +125,54 @@ class WordCNN(nn.Module):
         # X: (batch, n_vertices * n_bands, n_timepoints)
         return self.net(X)
 
+
+class StageCNN(nn.Module):
+    """Continuous-input classifier shaped around the multicolony stages.
+
+    Each (band, stage) block of colony-selected vertices is encoded on its own:
+    a spatial projection per (band, stage), per-band temporal filters that never
+    cross a stage edge, then log power inside the stage. The stage embeddings
+    stay in onset order and a linear head weights each (band, stage, filter), so
+    timing relative to onset is kept rather than pooled away.
+    
+    > Thanks Claude
+    """
+
+    def __init__(self, n_bands, n_stages, n_vertices, n_components=8, n_filters=8, kernel_size=5):
+        super().__init__()
+        k = min(n_vertices, n_components)
+        self.k = k
+        # grouped by (band, stage): each stage selects its own vertices (in index order),
+        # so channel i is a different vertex per stage and spatial weights can't be shared.
+        # bands are never summed together either
+        self.spatial = nn.Conv1d(n_bands * n_stages * n_vertices, n_bands * n_stages * k,
+                                 kernel_size=1, groups=n_bands * n_stages, bias=False)
+        # no padding: each stage is its own batch item, so filters only see that stage
+        self.temporal = nn.Conv1d(n_bands * k, n_bands * n_filters, kernel_size=kernel_size, groups=n_bands, bias=False)
+        n_feat = n_bands * n_stages * n_filters
+        # log power is scale-free up to an offset (vol is tesla-scale, inverse is dSPM),
+        # so standardize each feature against the batch -- i.e. against mostly-negative windows
+        self.norm = nn.BatchNorm1d(n_feat, affine=False)
+        self.head = nn.Linear(n_feat, 2)
+
+    def forward(self, X):
+        # X: (batch, n_bands, n_stages, n_vertices, stage_len); all-zero blocks are missing stages
+        B, nb, ns, V, S = X.shape
+        present = X.abs().amax(dim=(3, 4)) > 0                     # (B, nb, ns)
+
+        x = self.spatial(X.reshape(B, nb * ns * V, S))             # (B, nb*ns*k, S), ordered (band, stage, k)
+        x = x.reshape(B, nb, ns, self.k, S).permute(0, 2, 1, 3, 4)
+        x = self.temporal(x.reshape(B * ns, nb * self.k, S))       # stages -> batch; (B*ns, nb*F, S - kernel + 1)
+        x = torch.log(x.pow(2).mean(-1).clamp_min(1e-30))          # log power per filter within the stage
+        x = x.reshape(B, ns, nb, -1).permute(0, 2, 1, 3)           # (B, nb, ns, F)
+
+        # keep missing stages out of the batch statistics, then out of the logit
+        p = present[..., None].expand_as(x)
+        fill = (x * p).sum(0) / p.sum(0).clamp_min(1)
+        x = torch.where(p, x, fill.detach())
+        x = self.norm(x.reshape(B, -1)).reshape(B, nb, ns, -1) * p
+        return self.head(x.reshape(B, -1))
+
 def save_colony_state(f: str | Path = MODEL_STATE_PATH):
     path = Path(f)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +226,15 @@ def pad_or_truncate(x, length, axis=-1, value=0.0):
     pad[axis] = (0, length - n)
     return np.pad(x, pad, constant_values=value)
 
+def n_stages_for(word: str):
+    return max(1, int(label_duration(word) / MULTICOLONY_STEP))
+
+def _to_clf_input(X: np.ndarray):
+    if CLASSIFIER == "cnn":
+        N, nb, ns, V, S = X.shape
+        return np.ascontiguousarray(X.transpose(0, 1, 3, 2, 4).reshape(N, nb * V, ns * S))
+    return X
+
 def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], label: str):
     for band_name, band in TARGET_BANDS.items():
         low = band["low"]
@@ -212,34 +274,45 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
             spans = []
             for wi, row in enumerate(weights):
                 t0 = round(wi * MULTICOLONY_STEP * SFREQ)
-                t1 = min(round((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1])
-                if t0 >= t1:
+                t1 = t0 + STAGE_LEN
+                if t1 > src.shape[1]:
                     break
                 top = np.where(row >= np.quantile(row, PERCENTILE))[0]
                 spans.append(src[top, t0:t1])
-            b.append(np.concatenate(spans, axis=1))
+            # stages on their own axis; pad (zeros, masked in StageCNN) or cut to lb's stage count
+            b.append(pad_or_truncate(np.stack(spans), n_stages_for(lb), axis=0))
 
-        result[(source, lb)] = (np.concatenate(b), binary)
+        result[(source, lb)] = (np.stack(b), binary)
     return result
 
 
 def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], model_container: dict[tuple[str, str], NeuralNetClassifier], epochs=50, batch_size=32):
     for (source, lb), samples in buffers.items():
-        lb_dur_index = int(label_duration(lb) * SFREQ) + 1
-        X = np.stack([pad_or_truncate(s[0], lb_dur_index) for s in samples])
+        X = _to_clf_input(np.stack([s[0] for s in samples]))
         y = np.array([s[1] for s in samples], dtype=np.int64)
+
+        if CLASSIFIER == "stage" and len(y) < batch_size:
+            print(f"Skipping fit {source}/{lb}: {len(y)} samples < batch size {batch_size}")
+            continue
 
         pos_count = y.sum()
         neg_count = len(y) - pos_count
         pos_w = neg_count / len(y) if len(y) > 0 else 0.5
         neg_w = pos_count / len(y) if len(y) > 0 else 0.5
 
-        n_channels = X.shape[1]
-
-        clf = model_container.get((source, lb)) or \
-            NeuralNetClassifier(WordCNN(n_channels), max_epochs=epochs, lr=0.001, batch_size=batch_size, train_split=None, verbose=0,
-                                criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
-                                device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
+        clf = model_container.get((source, lb))
+        if clf is None:
+            if CLASSIFIER == "stage":
+                module = StageCNN(n_bands=X.shape[1], n_stages=X.shape[2], n_vertices=X.shape[3])
+                # its BatchNorm is over a flat feature vector, which can't train on a batch of 1
+                extra = {"iterator_train__drop_last": True}
+            else:
+                module = WordCNN(X.shape[1])
+                extra = {}
+            clf = NeuralNetClassifier(module, max_epochs=epochs, lr=0.001, batch_size=batch_size, train_split=None, verbose=0,
+                                      criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
+                                      device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu',
+                                      **extra)
 
         if pos_count == 0 or neg_count == 0:
             clf.criterion__weight = None # unweighted: negatives count fully
@@ -349,36 +422,34 @@ def model(meg: np.ndarray):
                     continue
                 
                 channels = []
-                
+
                 for band_name in TARGET_BANDS:
                     colony = colonies.get((source, band_name, word))
-                    
+
                     if colony is None:
                         continue
-                    
+
                     weights = colony.pos_weights()
-                    
+
                     if weights.ndim == 1:
                         weights = weights[np.newaxis]
                     src = band_data[band_name][source]
                     spans = []
                     for wi, row in enumerate(weights):
                         t0 = round(wi * MULTICOLONY_STEP * SFREQ)
-                        # according to Claude, MNE's crop is int(T * SFREQ) + 1, to do with include_max, tbd
-                        t1 = min(int((wi + 1) * MULTICOLONY_STEP * SFREQ), src.shape[1], int(label_duration(word) * SFREQ) + 1)
-                        if t0 >= t1:
+                        t1 = t0 + STAGE_LEN
+                        if t1 > src.shape[1]:
                             break
                         top = np.where(row >= np.quantile(row, PERCENTILE))[0]
                         spans.append(src[top, t0:t1])
-                    lb_dur_index = int(label_duration(word) * SFREQ) + 1
-                    channels.append(pad_or_truncate(np.concatenate(spans, axis=1), lb_dur_index))
-                
+                    channels.append(pad_or_truncate(np.stack(spans), n_stages_for(word), axis=0))
+
                 if not channels:
                     continue
-                
+
                 clf = clfs[k]
                 clf.module_.to(clf.device)
-                prob[word] += clf.predict_proba(np.concatenate(channels)[np.newaxis])[0, 1]
+                prob[word] += clf.predict_proba(_to_clf_input(np.stack(channels)[np.newaxis]))[0, 1]
                 clf.module_.to('cpu')
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -397,8 +468,17 @@ def validate(run, scores_path=None):
     success = 0
     fail = 0
 
-    # full score spectra, one row per window, columns in vocab-id order
-    all_primary, all_moses, labels = [], [], []
+    out = None
+    if scores_path is not None:
+        scores_path = Path(scores_path)
+        scores_path.parent.mkdir(parents=True, exist_ok=True)
+        out = open(scores_path, "w")
+        out.write(json.dumps({
+            "primary_vocab": [PRIMARY_ID_TO_VOCAB[i] for i in range(len(PRIMARY_ID_TO_VOCAB))],
+            "moses_vocab": [MOSES_ID_TO_VOCAB[i] for i in range(len(MOSES_ID_TO_VOCAB))],
+            "train_counts": dict(label_distribution),
+        }) + "\n")
+        out.flush()
 
     n_val = 0
     for meg, label in tqdm(run, desc="Validating", unit="window"):
@@ -408,9 +488,13 @@ def validate(run, scores_path=None):
             print(f"Validating {n_val}... {success}/{total} ({success/total*100:.1f}%)" if total else f"Validating {n_val}...")
 
         primary_list, moses_list, p, m = model(meg)
-        all_primary.append(primary_list)
-        all_moses.append(moses_list)
-        labels.append(label)
+        if out is not None:
+            out.write(json.dumps({
+                "label": label,
+                "primary": [round(float(s), 6) for s in primary_list],
+                "moses": [round(float(s), 6) for s in moses_list],
+            }) + "\n")
+            out.flush()
         all_p = nlargest(50, p, key=p.get)
         all_m = nlargest(50, m, key=m.get)
         top_p = nlargest(10, p, key=p.get)
@@ -433,19 +517,8 @@ def validate(run, scores_path=None):
     
     print(f"Validation: {success} successes, {fail} failures ({success / (success + fail) * 100:.2f}% accuracy)")
 
-    if scores_path is not None:
-        scores_path = Path(scores_path)
-        scores_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            scores_path,
-            primary=np.array(all_primary, dtype=np.float32),
-            moses=np.array(all_moses, dtype=np.float32),
-            label=np.array(labels),
-            primary_vocab=np.array([PRIMARY_ID_TO_VOCAB[i] for i in range(len(PRIMARY_ID_TO_VOCAB))]),
-            moses_vocab=np.array([MOSES_ID_TO_VOCAB[i] for i in range(len(MOSES_ID_TO_VOCAB))]),
-            train_words=np.array(list(label_distribution.keys())),
-            train_counts=np.array(list(label_distribution.values()), dtype=np.int64),
-        )
+    if out is not None:
+        out.close()
         print(f"Saved score spectra to {scores_path}")
 
 def main():
@@ -498,7 +571,7 @@ def main():
             one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
             one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
             
-            validate(one_run, f"pnpl/scores/after_run{i}_val_ses{run[1]}.npz")
+            validate(one_run, f"pnpl/scores/after_run{i}_val_ses{run[1]}.jsonl")
 
     for i, run in enumerate(TEST_RUNS):
         one_run = LibriBrainWord(
@@ -514,7 +587,7 @@ def main():
         one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
         one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
         
-        validate(one_run, f"pnpl/scores/test_ses{run[1]}.npz")
+        validate(one_run, f"pnpl/scores/test_ses{run[1]}.jsonl")
 
 if __name__ == "__main__":
     main()

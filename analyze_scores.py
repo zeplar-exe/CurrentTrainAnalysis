@@ -1,7 +1,8 @@
 # per-word hit / false-positive rates and accuracy vs training distribution,
-# from the .npz score spectra saved by validate()
-#   python analyze_scores.py pnpl/scores/after_run0_val_ses8.npz [more.npz ...]
+# from the .jsonl score spectra written by validate()
+#   python analyze_scores.py pnpl/scores/after_run0_val_ses8.jsonl [more.jsonl ...]
 # > Thanks Claude
+import json
 import sys
 
 import matplotlib.pyplot as plt
@@ -11,14 +12,39 @@ TOP_K = 10
 
 paths = sys.argv[1:]
 if not paths:
-    sys.exit("usage: python analyze_scores.py scores.npz [more.npz ...]")
+    sys.exit("usage: python analyze_scores.py scores.jsonl [more.jsonl ...]")
 
-data = [np.load(p) for p in paths]
+
+def load_scores(path):
+    """Header line + one line per window. A partial last line (crash mid-write) is dropped."""
+    with open(path) as f:
+        header = json.loads(f.readline())
+        rows = []
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"({path}: dropped a truncated line after {len(rows)} windows)")
+                break
+    train = header.get("train_counts", {})
+    return {
+        "label": np.array([r["label"] for r in rows]),
+        "primary": np.array([r["primary"] for r in rows], dtype=np.float32).reshape(-1, len(header["primary_vocab"])),
+        "moses": np.array([r["moses"] for r in rows], dtype=np.float32).reshape(-1, len(header["moses_vocab"])),
+        "primary_vocab": np.array(header["primary_vocab"]),
+        "moses_vocab": np.array(header["moses_vocab"]),
+        "train_words": np.array(list(train.keys())),
+        "train_counts": np.array(list(train.values()), dtype=np.int64),
+    }
+
+
+data = [load_scores(p) for p in paths]
+print(f"{sum(len(d['label']) for d in data)} windows from {len(paths)} file(s)")
 labels = np.concatenate([d["label"] for d in data])
 
 # training distribution from the last file (the latest checkpoint if files span several)
 train_counts = {}
-if "train_words" in data[-1]:
+if len(data[-1]["train_words"]):
     train_counts = dict(zip(data[-1]["train_words"], data[-1]["train_counts"].tolist()))
 else:
     print("(no training distribution in these files; skipping accuracy-vs-distribution)")
