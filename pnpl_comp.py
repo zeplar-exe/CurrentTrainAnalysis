@@ -1,5 +1,5 @@
 from collections import defaultdict
-from itertools import groupby
+from itertools import groupby, batched
 import pickle
 
 from mne.minimum_norm import apply_inverse_raw, prepare_inverse_operator
@@ -266,41 +266,36 @@ def train(run, do_colony=True, do_clf=True):
             if source == "inverse":
                 show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/moses-{source}_{band}_{label}.html")
     if do_clf:
-        primary_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
-        moses_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
-        i = 0
-        for meg, label in tqdm(run, desc="Collecting samples", unit="window"):
-            raw = create_raw(meg)
+        for batch in tqdm(batched(run, 100), desc="Collecting samples", unit="window"):
+            primary_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
+            moses_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
+            
+            for meg, label in batch:
+                raw = create_raw(meg)
 
-            band_data = {}
-            for band_name, band in TARGET_BANDS.items():
-                low = band["low"]
-                high = min(band["high"], SFREQ / 2.0 - 1)
-                raw_filtered = raw.copy()
-                raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
-                raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
-                band_data[band_name] = {
-                    "vol": raw_filtered.get_data().astype(np.float32), 
-                    "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
-                        lambda2=lambda2, method="dSPM", prepared=True,
-                        verbose="error").data.astype(np.float32),
-                }
+                band_data = {}
+                for band_name, band in TARGET_BANDS.items():
+                    low = band["low"]
+                    high = min(band["high"], SFREQ / 2.0 - 1)
+                    raw_filtered = raw.copy()
+                    raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
+                    raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
+                    band_data[band_name] = {
+                        "vol": raw_filtered.get_data().astype(np.float32), 
+                        "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
+                            lambda2=lambda2, method="dSPM", prepared=True,
+                            verbose="error").data.astype(np.float32),
+                    }
 
-            if label in PRIMARY_VOCAB_TO_ID:
-                for k, v in _collect_sample(band_data, primary_colonies_words, label).items():
-                    primary_buffers[k].append(v)
-            if label in MOSES_VOCAB_TO_ID:
-                for k, v in _collect_sample(band_data, moses_colonies_words, label).items():
-                    moses_buffers[k].append(v)
+                if label in PRIMARY_VOCAB_TO_ID:
+                    for k, v in _collect_sample(band_data, primary_colonies_words, label).items():
+                        primary_buffers[k].append(v)
+                if label in MOSES_VOCAB_TO_ID:
+                    for k, v in _collect_sample(band_data, moses_colonies_words, label).items():
+                        moses_buffers[k].append(v)
 
-            i += 1
-            if i % 100 == 0:
-                print(f"Collected {i} samples...")
-
-        print("Fitting primary classifiers...")
-        _fit_clfs(primary_buffers, primary_band_clfs)
-        print("Fitting moses classifiers...")
-        _fit_clfs(moses_buffers, moses_band_clfs)
+            _fit_clfs(primary_buffers, primary_band_clfs)
+            _fit_clfs(moses_buffers, moses_band_clfs)
 
 def model(meg: np.ndarray):
     raw = create_raw(meg)
