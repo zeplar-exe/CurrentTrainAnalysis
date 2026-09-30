@@ -1,7 +1,7 @@
 import argparse
 import json
 from collections import defaultdict
-from itertools import groupby, batched
+from itertools import groupby
 import pickle
 import re
 
@@ -46,6 +46,11 @@ TEST_RUNS  = [("0", str(s), "Sherlock1", "1") for s in range(10, 10 + 1)]  # ses
 
 PRIMARY_VOCAB = load_vocabulary("primary")      # the 50 competition words, in order
 MOSES_VOCAB = load_vocabulary("moses")        # the 50 Moses words (secondary metric)
+
+def batched(seq, n):
+    # itertools.batched is 3.12+
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
 
 def normalize_word(w):
     return str(w).strip().lower().replace("’", "'")
