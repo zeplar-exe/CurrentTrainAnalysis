@@ -5,7 +5,8 @@ from itertools import groupby, batched
 import pickle
 import re
 
-from mne.minimum_norm import apply_inverse_raw, prepare_inverse_operator
+from mne.minimum_norm import prepare_inverse_operator
+from mne.minimum_norm.inverse import _assemble_kernel
 import numpy as np
 from pnpl.competition import LibriBrainCompetitionHoldout, write_submission
 import sys
@@ -25,6 +26,7 @@ import warnings
 from skorch import NeuralNetClassifier
 from pnpl_word_durations import word_sd_duration, word_mean_duration
 import torch.nn as nn
+import torch.nn.functional as F
 
 warnings.filterwarnings(
     action="ignore", 
@@ -36,7 +38,7 @@ mne.set_log_level('ERROR')
 
 FIF = "~/.cache/huggingface/hub/datasets--pnpl--LibriBrain/snapshots/5a7c332b34fc7be329c4df3e527a41f67bfd878f/Sherlock1/sub-0/ses-1/meg/sub-0_ses-1_task-Sherlock1_run-1_meg.fif"
 
-TMIN, TMAX = 0.0, 1.0
+TMIN, TMAX = 0.1, 2.0
 DATA_PATH = Path(".") / "pnpl" / "libribrain_word"
 TRAIN_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(1, 7 + 1)]   # sessions 1-7
 VALIDATION_RUNS = [("0", str(s), "Sherlock1", "1") for s in range(8, 9 + 1)]   # sessions 8-9
@@ -67,12 +69,26 @@ PERCENTILE = 0.975
 STAGE_LEN = int(MULTICOLONY_STEP * SFREQ)
 CLASSIFIER = "stage"
 
+# vol only, no inverse: every stage gets all 306 channels, each scaled by its colony pos_weight
+# instead of the top-PERCENTILE cutoff. mags are first brought to grad scale (median |x| ratio
+# ~21 in every band) so the colony weight, not the sensor type, sets each channel's size
+VOL_WEIGHTED = True
+MAG_TO_GRAD = 21.0
+
+# classifiers are fit after all colonies are built, from band-filtered sensor windows cached
+# to disk (cropped to their label's duration)
+CACHE_DIR = Path("./pnpl/cache")
+CACHE_SCALE = 1e11  # float16 cache: puts mags (~2e-13 T) and grads (~5e-12 T/m) well inside float16 range
+
 MODEL_STATE_PATH = Path("./pnpl/model_state.pkl")
 
 info_fif = mne.io.read_info(FIF)
 info_fif = mne.pick_info(info_fif, mne.pick_types(info_fif, meg=True, exclude=[]))
 with info_fif._unlock():
     info_fif['sfreq'] = SFREQ
+
+VOL_SCALE = np.ones(len(info_fif.ch_names), dtype=np.float32)
+VOL_SCALE[mne.pick_types(info_fif, meg="mag", exclude=[])] = MAG_TO_GRAD
 
 def create_raw(meg):
     raw = mne.io.RawArray(meg, info_fif, verbose='error')
@@ -88,6 +104,12 @@ prepared_inv = prepare_inverse_operator(
     nave=1,
     lambda2=lambda2
 )
+
+# dSPM for any vertex subset: that subset's kernel rows applied to the sensors, the three
+# orientations pooled, then noise-normalized -- identical to apply_inverse_raw's output rows
+_kernel, _noise_norm, _, _ = _assemble_kernel(prepared_inv, None, "dSPM", None)
+INV_KERNEL = _kernel.reshape(-1, 3, _kernel.shape[1]).astype(np.float32)  # (n_src, 3, n_chan)
+INV_NOISE = np.asarray(_noise_norm).ravel().astype(np.float32)            # (n_src,)
 
 src_data = mne.read_source_spaces(src)
 
@@ -131,17 +153,21 @@ class StageCNN(nn.Module):
 
     Each (band, stage) block of colony-selected vertices is encoded on its own:
     a spatial projection per (band, stage), per-band temporal filters that never
-    cross a stage edge, then log power inside the stage. The stage embeddings
-    stay in onset order and a linear head weights each (band, stage, filter), so
-    timing relative to onset is kept rather than pooled away.
-    
+    cross a stage edge, then per filter: log power inside the stage plus the signed
+    filter output averaged into a few time bins. The stage embeddings stay in onset
+    order and the head is factored: a weight per stage times a linear map over
+    (band, filter, feature), so timing relative to onset is kept without a free
+    weight for every (stage, feature) pair -- ns + 2*n_feat weights instead of
+    2*ns*n_feat, against tens of positives per word per session.
+
     > Thanks Claude
     """
 
-    def __init__(self, n_bands, n_stages, n_vertices, n_components=8, n_filters=8, kernel_size=5):
+    def __init__(self, n_bands, n_stages, n_vertices, n_components=8, n_filters=8, kernel_size=5, n_bins=3):
         super().__init__()
         k = min(n_vertices, n_components)
         self.k = k
+        self.n_bins = n_bins
         # grouped by (band, stage): each stage selects its own vertices (in index order),
         # so channel i is a different vertex per stage and spatial weights can't be shared.
         # bands are never summed together either
@@ -149,10 +175,11 @@ class StageCNN(nn.Module):
                                  kernel_size=1, groups=n_bands * n_stages, bias=False)
         # no padding: each stage is its own batch item, so filters only see that stage
         self.temporal = nn.Conv1d(n_bands * k, n_bands * n_filters, kernel_size=kernel_size, groups=n_bands, bias=False)
-        n_feat = n_bands * n_stages * n_filters
+        n_feat = n_bands * n_filters * (1 + n_bins)
         # log power is scale-free up to an offset (vol is tesla-scale, inverse is dSPM),
         # so standardize each feature against the batch -- i.e. against mostly-negative windows
-        self.norm = nn.BatchNorm1d(n_feat, affine=False)
+        self.norm = nn.BatchNorm1d(n_stages * n_feat, affine=False)
+        self.stage_w = nn.Parameter(torch.full((n_stages,), n_stages ** -0.5))
         self.head = nn.Linear(n_feat, 2)
 
     def forward(self, X):
@@ -163,15 +190,20 @@ class StageCNN(nn.Module):
         x = self.spatial(X.reshape(B, nb * ns * V, S))             # (B, nb*ns*k, S), ordered (band, stage, k)
         x = x.reshape(B, nb, ns, self.k, S).permute(0, 2, 1, 3, 4)
         x = self.temporal(x.reshape(B * ns, nb * self.k, S))       # stages -> batch; (B*ns, nb*F, S - kernel + 1)
-        x = torch.log(x.pow(2).mean(-1).clamp_min(1e-30))          # log power per filter within the stage
-        x = x.reshape(B, ns, nb, -1).permute(0, 2, 1, 3)           # (B, nb, ns, F)
+        power = x.pow(2).mean(-1).clamp_min(1e-30)                 # (B*ns, nb*F)
+        # signed evoked shape: binned means over the stage RMS, so it's scale-free like log power
+        # (raw vol means are ~1e-13 and would vanish under BatchNorm's eps)
+        shape = F.adaptive_avg_pool1d(x, self.n_bins) / power.sqrt()[..., None]
+        x = torch.cat([torch.log(power)[..., None], shape], dim=-1)  # (B*ns, nb*F, 1 + n_bins)
+        x = x.reshape(B, ns, nb, -1).permute(0, 2, 1, 3)           # (B, nb, ns, F * (1 + n_bins))
 
         # keep missing stages out of the batch statistics, then out of the logit
         p = present[..., None].expand_as(x)
         fill = (x * p).sum(0) / p.sum(0).clamp_min(1)
         x = torch.where(p, x, fill.detach())
         x = self.norm(x.reshape(B, -1)).reshape(B, nb, ns, -1) * p
-        return self.head(x.reshape(B, -1))
+        x = x.permute(0, 2, 1, 3).reshape(B, ns, -1)               # (B, ns, nb * F * (1 + n_bins))
+        return self.head(torch.einsum("bsf,s->bf", x, self.stage_w))
 
 def save_colony_state(f: str | Path = MODEL_STATE_PATH):
     path = Path(f)
@@ -212,7 +244,10 @@ def load_colony_state(f: str | Path = MODEL_STATE_PATH):
     return state
 
 def label_duration(label: str):
-    return word_mean_duration(label, default=0.45) + 2*word_sd_duration(label, default=0.0)
+    return min(word_mean_duration(label, default=0.45) + 2*word_sd_duration(label, default=0.0) + 0.3, TMAX - TMIN)
+
+def n_stages_for(word: str):
+    return max(1, int(label_duration(word) / MULTICOLONY_STEP))
 
 def pad_or_truncate(x, length, axis=-1, value=0.0):
     n = x.shape[axis]
@@ -226,27 +261,38 @@ def pad_or_truncate(x, length, axis=-1, value=0.0):
     pad[axis] = (0, length - n)
     return np.pad(x, pad, constant_values=value)
 
-def n_stages_for(word: str):
-    return max(1, int(label_duration(word) / MULTICOLONY_STEP))
-
 def _to_clf_input(X: np.ndarray):
     if CLASSIFIER == "cnn":
         N, nb, ns, V, S = X.shape
         return np.ascontiguousarray(X.transpose(0, 1, 3, 2, 4).reshape(N, nb * V, ns * S))
     return X
 
+def _source_rows(sensors: np.ndarray, source: str, weights: np.ndarray, t0: int, t1: int):
+    """One stage of the colony's channels (weights: that stage's pos_weights row): sensor rows for vol,
+    dSPM of just those vertices for inverse. With VOL_WEIGHTED, vol is every channel scaled by its weight."""
+    x = sensors[:, t0:t1]
+    if source == "vol" and VOL_WEIGHTED:
+        return x * (VOL_SCALE * weights)[:, None]
+    rows = np.where(weights >= np.quantile(weights, PERCENTILE))[0]
+    if source == "vol":
+        return x[rows]
+    sol = INV_KERNEL[rows] @ x                                   # (V, 3, S)
+    return np.sqrt((sol ** 2).sum(1)) * INV_NOISE[rows, None]
+
 def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], MultiColony], label: str):
+    band_data = {}
     for band_name, band in TARGET_BANDS.items():
         low = band["low"]
         high = min(band["high"], SFREQ / 2.0 - 1)
 
         raw_filtered = raw.copy()
         raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
-        raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
+        raw_filtered.crop(tmin=0.0, tmax=min(label_duration(label), raw_filtered.times[-1]))
+        band_data[band_name] = raw_filtered.get_data()
 
         new_colonies = compute_gain(prepared_inv, raw_filtered,
-            lambda2, TIMESTEP, MULTICOLONY_STEP, None, 
-            include_vol=True, include_csd=False, include_inverse=True, 
+            lambda2, TIMESTEP, MULTICOLONY_STEP, None,
+            include_vol=True, include_csd=False, include_inverse=not VOL_WEIGHTED,
             include_pos=True, include_neg=False, use_epochs=False)
 
         for (source, _), new_colony in new_colonies.items():
@@ -255,9 +301,9 @@ def _digest(raw: mne.io.RawArray, colony_container: dict[tuple[str, str, str], M
                 colony_container[k].merge(new_colony)
             else:
                 colony_container[k] = new_colony
+    return band_data
 
-def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_container: dict[tuple[str, str, str], MultiColony], label: str) -> dict[tuple[str, str], tuple[np.ndarray, int]]:
-    label_distribution[label] += 1
+def _collect_sample(band_data: dict[str, np.ndarray], colony_container: dict[tuple[str, str, str], MultiColony], label: str) -> dict[tuple[str, str], tuple[np.ndarray, int]]:
     result = {}
 
     band_grouped = groupby(sorted(colony_container.items(), key=lambda x: (x[0][0], x[0][2])), lambda x: (x[0][0], x[0][2]))
@@ -267,7 +313,7 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
 
         for (_, band_name, _), colony in group:
             weights = colony.pos_weights()
-            src = band_data[band_name][source]
+            src = band_data[band_name]
 
             if weights.ndim == 1:
                 weights = weights[np.newaxis]
@@ -277,8 +323,7 @@ def _collect_sample(band_data: dict[str, dict[str, np.ndarray]], colony_containe
                 t1 = t0 + STAGE_LEN
                 if t1 > src.shape[1]:
                     break
-                top = np.where(row >= np.quantile(row, PERCENTILE))[0]
-                spans.append(src[top, t0:t1])
+                spans.append(_source_rows(src, source, row, t0, t1))
             # stages on their own axis; pad (zeros, masked in StageCNN) or cut to lb's stage count
             b.append(pad_or_truncate(np.stack(spans), n_stages_for(lb), axis=0))
 
@@ -310,6 +355,7 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
                 module = WordCNN(X.shape[1])
                 extra = {}
             clf = NeuralNetClassifier(module, max_epochs=epochs, lr=0.001, batch_size=batch_size, train_split=None, verbose=0,
+                                      optimizer=torch.optim.AdamW,
                                       criterion=nn.CrossEntropyLoss,  # type: ignore[arg-type]
                                       device='cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu',
                                       **extra)
@@ -339,47 +385,62 @@ def _fit_clfs(buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]], mode
         last_loss = clf.history[-1]['train_loss'] if clf.history else float('nan')
         print(f"Fit {source}/{lb}: {len(y)} samples, {pos_count} pos, {neg_count} neg, loss={last_loss:.4f}")
 
-def train(run, do_colony=True, do_clf=True):
-    if do_colony:
-        i = 0
-        for meg, label in tqdm(run, desc="Feeding colonies", unit="window"):
-            raw = create_raw(meg)
-            if label in PRIMARY_VOCAB_TO_ID:
-                _digest(raw, primary_colonies_words, label)
-            if label in MOSES_VOCAB_TO_ID:
-                _digest(raw, moses_colonies_words, label)
+def _cache_path(i: int) -> Path:
+    return CACHE_DIR / f"train_run{i}"
 
-            i += 1
-            if i % 100 == 0:
-                print(f"Digested {i} samples...")
-        
-        for (source, band, label), colony in primary_colonies_words.items():
-            if source == "inverse":
-                show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/primary-{source}_{band}_{label}.html")
-        for (source, band, label), colony in primary_colonies_words.items():
-            if source == "inverse":
-                show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/moses-{source}_{band}_{label}.html")
-    if do_clf:
-        for batch in tqdm(batched(run, 100), desc="Collecting samples", unit="window"):
+def train(run, cache_path: Path):
+    """Feed the colonies, caching each window's band-filtered sensor data (cropped to its label's duration)."""
+    blocks, lengths, labels = [], [], []
+    i = 0
+    for meg, label in tqdm(run, desc="Feeding colonies", unit="window"):
+        raw = create_raw(meg)
+        if label in PRIMARY_VOCAB_TO_ID:
+            band_data = _digest(raw, primary_colonies_words, label)
+        if label in MOSES_VOCAB_TO_ID:
+            band_data = _digest(raw, moses_colonies_words, label)
+        label_distribution[label] += 1
+
+        x = np.stack(list(band_data.values()))                              # (bands, chan, T)
+        blocks.append((x.transpose(2, 0, 1) * CACHE_SCALE).astype(np.float16))
+        lengths.append(x.shape[-1])
+        labels.append(label)
+
+        i += 1
+        if i % 100 == 0:
+            print(f"Digested {i} samples...")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path.with_suffix(".npy"), np.concatenate(blocks))          # (sum T, bands, chan)
+    cache_path.with_suffix(".json").write_text(json.dumps({"lengths": lengths, "labels": labels}))
+
+    for (source, band, label), colony in primary_colonies_words.items():
+        if source == "inverse":
+            show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/primary-{source}_{band}_{label}.html")
+    for (source, band, label), colony in primary_colonies_words.items():
+        if source == "inverse":
+            show_colony(colony, name=f"{source}_{band}_{label}", output=f"./pnpl/colonies/moses-{source}_{band}_{label}.html")
+
+def fit_from_cache(cache_paths: list[Path], epochs=15):
+    """The classifier loop train() used to run per run, now over every cached run with the final colonies.
+
+    Each epoch is one pass over all cached windows in shuffled 100-window chunks, one partial_fit epoch
+    per chunk, so no chunk is trained to convergence before the next one arrives."""
+    cached = []
+    for path in cache_paths:
+        data = np.load(path.with_suffix(".npy"), mmap_mode="r")
+        meta = json.loads(path.with_suffix(".json").read_text())
+        offsets = np.cumsum([0] + meta["lengths"])
+        cached += [(data[o:o + n], label) for o, n, label in zip(offsets, meta["lengths"], meta["labels"])]
+
+    for epoch in range(epochs):
+        order = [cached[i] for i in np.random.permutation(len(cached))]
+        for batch in tqdm(batched(order, 100), desc=f"Epoch {epoch + 1}/{epochs}", unit="chunk"):
             primary_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
             moses_buffers: dict[tuple[str, str], list[tuple[np.ndarray, int]]] = defaultdict(list)
-            
-            for meg, label in batch:
-                raw = create_raw(meg)
 
-                band_data = {}
-                for band_name, band in TARGET_BANDS.items():
-                    low = band["low"]
-                    high = min(band["high"], SFREQ / 2.0 - 1)
-                    raw_filtered = raw.copy()
-                    raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
-                    raw_filtered.crop(tmin=0.0, tmax=label_duration(label))
-                    band_data[band_name] = {
-                        "vol": raw_filtered.get_data().astype(np.float32), 
-                        "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
-                            lambda2=lambda2, method="dSPM", prepared=True,
-                            verbose="error").data.astype(np.float32),
-                    }
+            for x, label in batch:
+                x = np.asarray(x, dtype=np.float32).transpose(1, 2, 0) / CACHE_SCALE   # (bands, chan, T)
+                band_data = dict(zip(TARGET_BANDS, x))
 
                 if label in PRIMARY_VOCAB_TO_ID:
                     for k, v in _collect_sample(band_data, primary_colonies_words, label).items():
@@ -388,8 +449,8 @@ def train(run, do_colony=True, do_clf=True):
                     for k, v in _collect_sample(band_data, moses_colonies_words, label).items():
                         moses_buffers[k].append(v)
 
-            _fit_clfs(primary_buffers, primary_band_clfs)
-            _fit_clfs(moses_buffers, moses_band_clfs)
+            _fit_clfs(primary_buffers, primary_band_clfs, epochs=1)
+            _fit_clfs(moses_buffers, moses_band_clfs, epochs=1)
 
 def model(meg: np.ndarray):
     raw = create_raw(meg)
@@ -400,12 +461,7 @@ def model(meg: np.ndarray):
         high = min(band["high"], SFREQ / 2.0 - 1)
         raw_filtered = raw.copy()
         raw_filtered.filter(l_freq=low, h_freq=high, fir_design='firwin', n_jobs=1, verbose='error')
-        band_data[band_name] = {
-            "vol": raw_filtered.get_data().astype(np.float32),
-            "inverse": apply_inverse_raw(raw_filtered, prepared_inv,
-                lambda2=lambda2, method="dSPM", prepared=True,
-                verbose="error").data.astype(np.float32),
-        }
+        band_data[band_name] = raw_filtered.get_data().astype(np.float32)
 
     primary_prob = defaultdict(float)
     moses_prob = defaultdict(float)
@@ -433,15 +489,14 @@ def model(meg: np.ndarray):
 
                     if weights.ndim == 1:
                         weights = weights[np.newaxis]
-                    src = band_data[band_name][source]
+                    src = band_data[band_name]
                     spans = []
                     for wi, row in enumerate(weights):
                         t0 = round(wi * MULTICOLONY_STEP * SFREQ)
                         t1 = t0 + STAGE_LEN
                         if t1 > src.shape[1]:
                             break
-                        top = np.where(row >= np.quantile(row, PERCENTILE))[0]
-                        spans.append(src[top, t0:t1])
+                        spans.append(_source_rows(src, source, row, t0, t1))
                     channels.append(pad_or_truncate(np.stack(spans), n_stages_for(word), axis=0))
 
                 if not channels:
@@ -550,28 +605,30 @@ def main():
         one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
         one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
         
-        print("\tCurrent Label Distribution:", dict(label_distribution))
-        train(one_run)
-        print(f"Finished training run {i}, saving and validating...")
+        train(one_run, _cache_path(i))
+        print(f"Finished colonies for training run {i}, saving...")
         save_colony_state(f"pnpl/models/colony_run{i}.pt")
-        print("\tCurrent Label Distribution:", dict(label_distribution))
-        
-        
-        for j, run in enumerate(VALIDATION_RUNS):
-            one_run = LibriBrainWord(
-                data_path=str(DATA_PATH),
-                include_run_keys=[run],
-                tmin=TMIN,
-                tmax=TMAX,
-                standardize=False,     # show raw-ish values for this first look
-                include_info=True,     # also return a dict with the word string, onset, etc.
-                preload_files=False,   # download lazily instead of all-at-once
-            )
-            
-            one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
-            one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
-            
-            validate(one_run, f"pnpl/scores/after_run{i}_val_ses{run[1]}.jsonl")
+
+    # classifiers only once the colonies are final, so every fit sees the same vertex selection
+    fit_from_cache([_cache_path(i) for i in range(len(TRAIN_RUNS))])
+    save_colony_state("pnpl/models/colony_final.pt")
+    print("\tLabel Distribution:", dict(label_distribution))
+
+    for j, run in enumerate(VALIDATION_RUNS):
+        one_run = LibriBrainWord(
+            data_path=str(DATA_PATH),
+            include_run_keys=[run],
+            tmin=TMIN,
+            tmax=TMAX,
+            standardize=False,     # show raw-ish values for this first look
+            include_info=True,     # also return a dict with the word string, onset, etc.
+            preload_files=False,   # download lazily instead of all-at-once
+        )
+
+        one_run = [(r[0], normalize_word(one_run.id_to_word[int(r[1])])) for r in one_run]
+        one_run = [r for r in one_run if r[1] in PRIMARY_VOCAB_TO_ID or r[1] in MOSES_VOCAB_TO_ID]
+
+        validate(one_run, f"pnpl/scores/final_val_ses{run[1]}.jsonl")
 
     for i, run in enumerate(TEST_RUNS):
         one_run = LibriBrainWord(
