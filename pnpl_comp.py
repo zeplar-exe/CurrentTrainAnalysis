@@ -72,7 +72,7 @@ PERCENTILE = 0.975
 
 # classifier inputs are (band, stage, vertex, sample): one block per multicolony stage
 STAGE_LEN = int(MULTICOLONY_STEP * SFREQ)
-CLASSIFIER = "stage"
+CLASSIFIER = "cnn"
 
 # vol only, no inverse: every stage gets all 306 channels, each scaled by its colony pos_weight
 # instead of the top-PERCENTILE cutoff. mags are first brought to grad scale (median |x| ratio
@@ -277,7 +277,7 @@ def _source_rows(sensors: np.ndarray, source: str, weights: np.ndarray, t0: int,
     dSPM of just those vertices for inverse. With VOL_WEIGHTED, vol is every channel scaled by its weight."""
     x = sensors[:, t0:t1]
     if source == "vol" and VOL_WEIGHTED:
-        return x * (VOL_SCALE * weights)[:, None]
+        return x * (VOL_SCALE * weights).astype(np.float32)[:, None]   # pos_weights are float64
     rows = np.where(weights >= np.quantile(weights, PERCENTILE))[0]
     if source == "vol":
         return x[rows]
