@@ -24,6 +24,14 @@ ColonyMap = dict[tuple[ColonySource, str], "MultiColony"]
 TIMESTEP = 25 / 1000 # s
 MULTICOLONY_STEP = 75 / 1000 # s
 
+EEGBCI_RUNS = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+EEGBCI_RUN_LABELS = {
+    **{r: {"T0": "rest", "T1": "left_fist", "T2": "right_fist"} for r in (3, 7, 11)},
+    **{r: {"T0": "rest", "T1": "imag_left_fist", "T2": "imag_right_fist"} for r in (4, 8, 12)},
+    **{r: {"T0": "rest", "T1": "both_fists", "T2": "both_feet"} for r in (5, 9, 13)},
+    **{r: {"T0": "rest", "T1": "imag_both_fists", "T2": "imag_both_feet"} for r in (6, 10, 14)},
+}
+
 
 class Colony:
     DEVIATION_RESOLUTION = 2.0 # s
@@ -216,6 +224,17 @@ def _read_grasplift_record(record: Path, spec: dict):
 def load_subject(dataset, subject):
     spec = get_dataset_spec(dataset)
 
+    if dataset == "eegbci":
+        if isinstance(subject, str) and subject.upper().startswith("S"):
+            subject_id = int(subject[1:])
+        else:
+            subject_id = int(subject)
+
+        records = mne.datasets.eegbci.load_data(subjects=[subject_id], runs=EEGBCI_RUNS)
+        if not records:
+            raise ValueError(f"Subject {subject} not found in dataset {dataset}")
+        return records[0], records[1:]
+
     if dataset == "grasplift":
         series = sorted(spec["root"].glob(f"{subject}_series*_data.csv"),
                         key=lambda p: int(p.stem.split("_series")[1].split("_")[0]))
@@ -226,6 +245,12 @@ def load_subject(dataset, subject):
     raise ValueError(f"Unsupported dataset: {dataset}")
     
 def fix_raw(dataset, raw):
+    if dataset == "eegbci":
+        mapping = {name: name.rstrip('.') for name in raw.ch_names}
+        raw.rename_channels(mapping)
+        raw.set_montage('standard_1005')
+        raw.set_eeg_reference(projection=True)
+
     raw.notch_filter(freqs=60.0, fir_design='firwin')
     
     ica = mne.preprocessing.ICA(n_components=0.995, method='fastica')
@@ -239,7 +264,14 @@ def fix_raw(dataset, raw):
 def read_subject_record(dataset, record):
     spec = get_dataset_spec(dataset)
 
-    if dataset == "grasplift":
+    if dataset == "eegbci":
+        raw = mne.io.read_raw_edf(record, preload=True, verbose="error")
+        run = int(str(record)[-6:-4])
+        if run in EEGBCI_RUN_LABELS:
+            raw.annotations.rename(EEGBCI_RUN_LABELS[run])
+        raw.annotations.delete(np.flatnonzero(raw.annotations.description == "rest"))
+        events, _ = mne.events_from_annotations(raw)
+    elif dataset == "grasplift":
         raw, events = _read_grasplift_record(record, spec)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
@@ -247,7 +279,7 @@ def read_subject_record(dataset, record):
     fix_raw(dataset, raw)
 
     return raw, events
-      
+
 def build_hemisphere_mirror_map(src_data, lh_vertno, rh_vertno):
     lh_coords = src_data[0]['rr'][lh_vertno]
     rh_coords = src_data[1]['rr'][rh_vertno]

@@ -39,6 +39,21 @@ BANDS = {
 }
 
 DATASET_SPECS = {
+    "eegbci": {
+        "root": Path("./datasets/eegbci"),
+        "sfreq": 160.0,
+        "subjects": [f"S{i:03d}" for i in range(1, 110)],
+        "event_ids": {
+            1: "left_fist",
+            2: "right_fist",
+            3: "imag_left_fist",
+            4: "imag_right_fist",
+            5: "both_fists",
+            6: "both_feet",
+            7: "imag_both_fists",
+            8: "imag_both_feet",
+        },
+    },
     "grasplift": {
         "root": Path("./datasets/grasplift/train"),
         "sfreq": 500.0,
