@@ -1,5 +1,3 @@
-# query by subjects, bands, events, datasets; perhaps cluster after this
-
 from collections import defaultdict
 from pathlib import Path
 import numpy as np

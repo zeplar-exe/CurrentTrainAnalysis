@@ -78,19 +78,19 @@ class Colony:
             last_matrix = current_matrix
     
     def raw_weights(self):
-        pc = np.percentile(self.colony_raw, 99)
+        pc = np.percentile(self.colony_raw, 99.9)
         return Colony._safe_weights(self.colony_raw, pc)
 
     def abs_weights(self):
-        pc = np.percentile(self.colony_abs, 99)
+        pc = np.percentile(self.colony_abs, 99.9)
         return Colony._safe_weights(self.colony_abs - np.min(self.colony_abs), pc)
 
     def pos_weights(self):
-        pc = np.percentile(self.colony_pos, 99)
+        pc = np.percentile(self.colony_pos, 99.9)
         return Colony._safe_weights(self.colony_pos - np.min(self.colony_pos), pc)
 
     def neg_weights(self):
-        pc = np.percentile(np.abs(self.colony_neg), 99)
+        pc = np.percentile(np.abs(self.colony_neg), 99.9)
         return Colony._safe_weights(self.colony_neg - np.max(self.colony_neg), -pc)
 
     def merge(self, other: "Colony"):
@@ -117,28 +117,32 @@ class MultiColony:
         self.size = size
         self.interval = interval
     
-    def raw_weights(self):
+    def raw_weights(self, cut_zero=True):
         last_idx = len(self.colonies)
-        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_raw):
-            last_idx -= 1
+        if cut_zero:
+            while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_raw):
+                last_idx -= 1
         return np.array([colony.raw_weights() for colony in self.colonies[:last_idx]])
     
-    def abs_weights(self):
+    def abs_weights(self, cut_zero=True):
         last_idx = len(self.colonies)
-        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_abs):
-            last_idx -= 1
+        if cut_zero:
+            while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_abs):
+                last_idx -= 1
         return np.array([colony.abs_weights() for colony in self.colonies[:last_idx]])
     
-    def pos_weights(self):
+    def pos_weights(self, cut_zero=True):
         last_idx = len(self.colonies)
-        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_pos):
-            last_idx -= 1
+        if cut_zero:
+            while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_pos):
+                last_idx -= 1
         return np.array([colony.pos_weights() for colony in self.colonies[:last_idx]])
 
-    def neg_weights(self):
+    def neg_weights(self, cut_zero=True):
         last_idx = len(self.colonies)
-        while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_neg):
-            last_idx -= 1
+        if cut_zero:
+            while last_idx > 0 and not np.any(self.colonies[last_idx - 1].colony_neg):
+                last_idx -= 1
         return np.array([colony.neg_weights() for colony in self.colonies[:last_idx]])
     
     def merge(self, other: "MultiColony"):
@@ -273,7 +277,7 @@ def setup_inverse(dataset, subject, raw_baseline, ad_hoc_resting=False, info=Non
     
     fs_dir = mne.datasets.fetch_fsaverage(verbose=True)
 
-    src = fs_dir / "bem" / "fsaverage-ico-5-src.fif"
+    src = fs_dir / "bem" / "fsaverage-ico-3-src.fif"
     bem = fs_dir / "bem" / "fsaverage-5120-5120-5120-bem-sol.fif"
     
     if save_file.exists():
@@ -541,103 +545,47 @@ Subject: {subject} ({subject_index + 1}/{len(target_subjects)})"""
                         if include_neg:
                             write_colony(colony, "neg", source, band_name, group, mirror_key)
 
-# + we need to set this up as a reusable funciton that is agnostic to input stream (raw vs csd vs inverse)
-# + we need to set this up to run on all of the records and beyond
-    # we also need to aggregate same event across all subjects (this is a per head model thing) 
-# + we need to store the forward model for fast reload; but does it change across subjects or datasets?
-# + we need to see if strongest vertices across bands are the same or not
-    # / they do, in fact, have a bit of non-overlap, depending on the band
-    # if not, that increases our feature space, kinda; will have to test with a decoder 
-    # where we include vertex data at certain frequency band; this allow duplicate
-    # vertices at different bands
-# + also need to experiment with the timestep, deviation resolution a bit
-    # - what about snr and lambda2?
-# - should we test out sLORETTA or does that not work with our setup?
-
-
-# btw: inverse is kinda easiest for cross-dataset decoding
-    # but we should do both cross-dataset (inverse only) and same-dataset (raw, inverse, and csd)
-# we gotta find papers that implement raw, csd, or inverse decoders and see if this selection method improves things
-    # can weight the input data directory per channel (based on the 99th percentile) if linear-ish model
-        # nn.Parameter(weights) with grad vs no_grad? claude mentioned this
-    # can retrain with training data weighted perhaps? 
-# The comparison to Fisher-score selection or anatomical selection on the same decoders is a result
-    # any others I should know about for testing?
-# + consider: this is a binary encoder for 1 singular type of event, though it can be expended to multi-event
-    # + as in: give epochs of multiple events, so you know what electrodes are generally shared and active
-# + any good classifier with this should give a probability for the given event to occur
-    # + we can do a multi-class probability decoder with this via combination of multiple binary classifiers, one per event
-
 # WE OUGHT TO DO some literature review on electrode/vertex/feature selection methods
-    # https://www.nature.com/articles/s41598-022-15252-0
-    # https://link.springer.com/article/10.1186/s13634-015-0251-9#Sec3
-# also: let's just find the 32, 64, 128 datasets we want to use so we're not limited to MI
-    # + refactor _read_csv_record to be eegmmidb-specific (remove the glob in the spec and put it here)
-# + ADD: we need to have a check for a null raw baseline and use the... default noise covariance?
-# - how do we choose when to mirror and when not to mirror during colony growth?
-# + HEY HEY: what if we mapped the grasplift events to be 100ms earlier? since we're catching unwanted occipital data
-# ALSO ALSO: it would be nice to use the eye dataset after all since it's fully self contained events (blinks, saccades, fixations)
-# ALSO ALSO: we ought to update colony_path.py to use the raw data instead of the windows cause windows of growth aren't useful?? I think, but I'm tired
-    # actually yeah no shit; for the synthetic generator, we care about the scale of the deviations, not the windows of growth
-# looks like we have an unsupervised clusterer on our hands: test by collecting colony on some arbitrary event (or relaxation) 
-    # + would also need to implement the weighting of the coalesced colony someway
-    # + also: do we mirror the input epoch? I guess so; you could test with/without
-    # + oh, we should do this per-band too, to see if the band has an effect on the accuracy
-    # - cause: inverse handles spatial densities; CSD handles dipoles and provides another form of localization
-    # + for now, I say we should cut out the top 5% or 10% (for ex, occipital overloading) and see if accuracy goes up
-# + HEYO: we can integrate both positives and negatives; we weight them accordingly such that a highly weighted pos vertex adds to the probability a lot if the value is positive (and level of positivity can increase certainty relative to the weight perhaps), do the same for negatives
-# + after that, we can test with a supervised decoder like before; use top nth percentile barrier and see what happens
-
-# - also also, we should probably do the mirroring for csd and raw too
-
-# what about the path idea by the way?
-    # we can do a 2nd pass using the top n% vertices and then go through every window and get the average activations temporally
-# - also also, when we have more events, we should cut out the broadband noise that appears in every single one to see if accuracy can improve without cutting the truly valuable electrodes
-    # / what?
+    # + https://link.springer.com/article/10.1186/s13634-015-0251-9#Sec3
 
 
-# anywho: a second report is on the amount of vertex overlap (top 5, 15, 25, 50 vertices) per-event within and across subjects and bands
-    # this only applies to the abs and pos colonies
-    # we can show that the raw deviation colonies skew *left* and are not very useful
-        # claude: apparently this means that most of the cortex is desynchronized (ERD) 
-        # and focal sync (ERS) takes over... I don't buy, will have to research
-    # "a Jaccard matrix across bands, one number per pair, immediately readable"
-        # what?
+# overall: how does this compare to CSP *at the very least*?
+# hell, just because an eleectrode is active does not mean that it is discriminative; that seems to be the main result
+# 0. need to choose a study or some
+    # 0.1. https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0361026
+# 1. take colonies per-subject, per-band, coalesced over event
+# 2. set a cutoff for SD or other variance metric where a subject-band colony is too diffuse and thus a poor discriminator
+    # 2.1. or better, use this as a discriminability/weight score per band
+# 3. cluster subject coalesce colonies per-band and either have one classifier per cluster, or take each cluster and use weights from each
+    # 3.1. alternatively, provide a way to determine what cluster a subject falls under
+    # 3.2. we also need to decide on a few percentiles to use; subject clustering uses percentiles
+    # 3.3. can we create a across-subject clusterer using numbers instead of overlap?
+    # 3.4 anywho: a secondary report is on the amount of vertex overlap per-event within and across subjects and bands
+# 4. test existing decoders on weighted clusters (where mathematically applicable) and top-n node limiter, same as pnpl
+    # 4.1. we can test with both whole-event colonies and multicolonies; note the temporal distinction
+# 5. by the way, we ought to test with all 4 colony modes; perhaps some are better than others for certain BCI tasks
+    # 5.1. also notable to mention that phase does not matter when computing colonies
+    # 5.2. can weight the input data directory per channel (based on the 99th percentile) if linear-ish model
+        # nn.Parameter(weights) with grad vs no_grad? claude mentioned this
+    # 5.3. can retrain with training data weighted perhaps? 
+    # 5.4. The comparison to Fisher-score selection or anatomical selection on the same decoders is a result
+        # any others I should know about for testing?    
 
-# null result #1: there is no discernible differene in vertex firings
-    # already proven false
-# null result #2: feature selection in this way has no significant effect on accuracy
 
+# VISUALS
+# we can include some of the coalesced colonies
+    # for ex: (for alpha) show that the inverses of the hand grip events are massively red in the frontal cortex while the CSD show contralateralization
+    # for ex: (for alpha) show that the inverses of the imagined hand grip events are massively red in the frontal cortex while the CSD show ipsilateralization
+        # we should probably confirm this with, you guessed it, a literature review
+# for rigor: report skewness on our colony files
+    # claude says skewness coefficient is effect size and fine on its own (since n is large)
+    # should go ahead and confirm this  
+    
 
 # methods notes: 
     # ICA to kill random shit
     # we're sticking with dMSB https://sdgsreview.org/LifestyleJournal/article/view/7511
     # using (a-b)/b because occipital lobe was fucking things up with constant, relatively small changes, so now gain is relative to the baseline itself
         # this does mean a baseline close to zero can cause a spike, mitigated by averaging and sample size
-    # hemispheric mirroring to deal with general lateralization
-        # for anything that is heavily lateralized to one side this hurts btw (aka, no generalizability here)
-    # using different bands because some events respond better on different bands
+    # using different bands because some events respond better on different bands (need a citation)
     # limitation: not dealing with different sized electrode arrays for EEG and CSD
-
-# for rigor: report skewness on our colony files
-    # claude says skewness coefficient is effect size and fine on its own (since n is large)
-    # should go ahead and confirm this
-# - The tail ratio: what fraction of total variance/power is carried by the top 10%, 25%, 50% of vertices?
-    # / variance is noise
-# Gini coefficient: measures concentration. 0 = perfectly uniform (every vertex equal), 1 = all value in one vertex.
-# - get % of the total gain across all electrodes/vertices is handled by per percentile
-    # / will be very low
-
-# we can include some of the coalesced colonies
-    # for ex: (for alpha) show that the inverses of the hand grip events are massively red in the frontal cortex while the CSD show contralateralization
-    # for ex: (for alpha) show that the inverses of the imagined hand grip events are massively red in the frontal cortex while the CSD show ipsilateralization
-        # we should probably confirm this with, you guessed it, a literature review
-        
-        
-
-# what about generalization?
-    # we know that the occipital lobe takes the cake a lot, so via state machine or something, determine that occipital needs to be removed... somehow
-    # also: do you reckon we can calculate per-lobe density? for state machining (somehow)
-        # alternatively, we could just kill a lobe we don't want for a certain event (ad hoc choice... should be customizable)
-    # and: how do we manage lateralization? we're still flatly doing mirroring everywhere...
-    # statem achine: is it even possible to generally identify "motor cortex planning" -> detect which specific action?

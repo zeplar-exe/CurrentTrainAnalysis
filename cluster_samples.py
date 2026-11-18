@@ -8,14 +8,12 @@
 
 # !!! double check SD and variance across events in JASP for per-subject and across-subject/coalesce
 # !! also need to eyeball clusters in all subjects; 
-# !! ALSO we need to start using the eye control dataset, and an error detection dataset
 # need to look at overlap across per-band clusters
 
 # by the way again: what if we split out by cluster and then pass the raw growth values into a supervised decoder on an ms basis? 
 
 # by the way... how do we, like, force a cluster to appear multiple time intra subject, OR multiple times intersubject to be considered a cluster?
 # also: let's export raw (not pos or neg, raw), I want to test it for clustering (still using top percentile)
-# also lets test clustering on https://www.kaggle.com/competitions/pnpl-competition-2026-deep/overview
 
 import matplotlib.pyplot as plt
 from coalesce_colonies import coalesce_colonies
